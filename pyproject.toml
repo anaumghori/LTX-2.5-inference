@@ -1,0 +1,25 @@
+[project]
+name = "ltx-2-5-engine"
+version = "0.1.0"
+description = "LTX-2.5 inference engine"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.4.0",
+    "safetensors>=0.4.3",
+    "transformers>=4.46.0",
+    "huggingface_hub>=0.26.0",
+    "numpy>=1.26.0",
+    "imageio>=2.34.0",
+    "imageio-ffmpeg>=0.5.1",
+]
+[dependency-groups]
+dev = ["pytest>=8.0", "pillow>=10.0.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "cpu: fast tests that need no checkpoint weights",
+    "gpu: tests that need the real checkpoint and an accelerator",
+]
+

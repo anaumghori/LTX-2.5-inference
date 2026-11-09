@@ -1,4 +1,3 @@
-import copy
 import math
 import numpy as np
 import torch
@@ -209,6 +208,3 @@ class FlowMatchEulerScheduler:
         self._step_index += 1
         return prev_sample.to(model_output.dtype)
 
-    def clone(self):
-        """Return an independent copy of the scheduler, including its current state."""
-        return copy.deepcopy(self)

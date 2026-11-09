@@ -1,3 +1,6 @@
+import contextlib
+import contextvars
+import math
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -24,6 +27,23 @@ CHECKPOINT_TO_LOCAL_PREFIXES = [
     ("adaln_single", "time_embed"),
     ("patchify_proj", "proj_in"),
 ]
+
+# The strength every adapter currently computes with. It is set by the stage that is
+# running and read when a wrapped layer produces its update, so the module tree never
+# changes during a request and no stage can leave its strength behind for the next one.
+_strength = contextvars.ContextVar("lora_strength", default=1.0)
+
+
+@contextlib.contextmanager
+def lora_strength(value):
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"LoRA strength must be finite and non-negative, got {value}.")
+    token = _strength.set(value)
+    try:
+        yield
+    finally:
+        _strength.reset(token)
 
 
 def map_lora_target(key):
@@ -123,10 +143,14 @@ class LoRAAugmentedLinear(nn.Module):
 
     def forward(self, x):
         out = self.base(x)
+        # A zero strength removes the adapter from the arithmetic completely
+        strength = _strength.get()
+        if strength == 0.0:
+            return out
         # Run the low-rank path in its stored precision for stability, then convert back
         # so the adjustment matches the base output before the two are combined.
         lora_out = F.linear(F.linear(x.to(self.lora_A.dtype), self.lora_A), self.lora_B)
-        return out + self.lora_scale * lora_out.to(out.dtype)
+        return out + (strength * self.lora_scale) * lora_out.to(out.dtype)
 
 
 def apply_lora(root, entries, scale=1.0):
@@ -145,8 +169,6 @@ def apply_lora(root, entries, scale=1.0):
         Records of the replaced layers, for use with `remove_lora`.
     """
     originals = []
-    original_devices = []
-    original_dtypes = []
     skipped = []
     try:
         for target, pair in entries.items():
@@ -160,19 +182,17 @@ def apply_lora(root, entries, scale=1.0):
                 continue
             if pair["A"].shape[1] != base.in_features or pair["B"].shape[0] != base.out_features:
                 raise ValueError(f"LoRA matrices for {target} do not match Linear({base.in_features}, {base.out_features})")
-            base_device = base.weight.device
-            base_dtype = base.weight.dtype
-            augmented = LoRAAugmentedLinear(base, pair["A"], pair["B"], scale * pair["scale"])
-            setattr(parent, name, augmented)
             originals.append((parent, name, base))
-            original_devices.append(base_device)
-            original_dtypes.append(base_dtype)
+            setattr(
+                parent,
+                name,
+                LoRAAugmentedLinear(base, pair["A"], pair["B"], scale * pair["scale"]),
+            )
     except Exception:
         # If anything fails partway, put every already-swapped layer back so the model
         # is never left with only half of the adapter applied.
-        for (parent, name, base), base_device, base_dtype in zip(originals, original_devices, original_dtypes):
+        for parent, name, base in originals:
             setattr(parent, name, base)
-            base.to(device=base_device, dtype=base_dtype)
         raise
     if skipped:
         logger.warning(f"LoRA skipped {len(skipped)} targets with no matching module:")
@@ -182,10 +202,11 @@ def apply_lora(root, entries, scale=1.0):
     # than half the targets usually means the wrong adapter is being applied, so roll back
     # everything instead of leaving a partially adapted model.
     if len(originals) * 2 < len(entries):
-        for (parent, name, base), base_device, base_dtype in zip(originals, original_devices, original_dtypes):
+        for parent, name, base in originals:
             setattr(parent, name, base)
-            base.to(device=base_device, dtype=base_dtype)
-        raise ValueError(f"LoRA applied to only {len(originals)} of {len(entries)} targets, refusing partial application")
+        raise ValueError(
+            f"LoRA applied to only {len(originals)} of {len(entries)} targets, refusing partial application"
+        )
     logger.debug(f"Applied LoRA to {len(originals)} linear layers with scale {scale}")
     return originals
 

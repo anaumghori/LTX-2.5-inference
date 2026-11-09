@@ -509,7 +509,7 @@ class VideoEncoder3d(nn.Module):
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p
         post_patch_width = width // p
-        causal = causal or self.is_causal
+        causal = self.is_causal if causal is None else causal
         hidden_states = hidden_states.reshape(
             batch_size, num_channels, post_patch_num_frames, p_t, post_patch_height, p, post_patch_width, p
         )
@@ -606,14 +606,14 @@ class VideoDecoder3d(nn.Module):
             self.time_embedder = PixArtAlphaCombinedTimestepSizeEmbeddings(output_channel * 2)
             self.scale_shift_table = nn.Parameter(torch.randn(2, output_channel) / output_channel**0.5)
 
-    def forward(self, hidden_states, temb=None, causal=None):
-        causal = causal or self.is_causal
+    def forward(self, hidden_states, temb=None, causal=None, generator=None):
+        causal = self.is_causal if causal is None else causal
         hidden_states = self.conv_in(hidden_states, causal=causal)
         if self.timestep_scale_multiplier is not None:
             temb = temb * self.timestep_scale_multiplier
-        hidden_states = self.mid_block(hidden_states, temb, causal=causal)
+        hidden_states = self.mid_block(hidden_states, temb, generator=generator, causal=causal)
         for up_block in self.up_blocks:
-            hidden_states = up_block(hidden_states, temb, causal=causal)
+            hidden_states = up_block(hidden_states, temb, generator=generator, causal=causal)
         hidden_states = self.norm_out(hidden_states)
         if self.time_embedder is not None:
             temb = self.time_embedder(
@@ -681,6 +681,6 @@ class VideoVAE(nn.Module):
     def encode(self, x):
         return self.encoder(x)
 
-    def decode(self, z, temb=None):
+    def decode(self, z, temb=None, generator=None):
         """Decode latents into video frames, optionally modulated by a timestep embedding."""
-        return self.decoder(z, temb)
+        return self.decoder(z, temb, generator=generator)

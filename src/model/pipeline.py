@@ -1,20 +1,22 @@
 import copy
 import dataclasses
+from pathlib import Path
+from typing import Optional
+import imageio.v2 as imageio
 import numpy as np
 import torch
-from pathlib import Path
-import imageio.v2 as imageio
 
 from src.cache.residual_cache import ResidualCache, cache_for_pass
+from src.model.attention_backend import stage_backends
 from src.model.common import (
     DiagonalGaussian,
     duration_frame_bounds,
     resolve_device,
     resolve_num_frames,
 )
-from src.model.config import EngineConfig
+from src.model.config import EngineConfig, GenerationSettings
 from src.model.logging_utils import get_logger
-from src.model.lora import apply_lora, remove_lora
+from src.model.lora import apply_lora, lora_strength
 from src.model.scheduler import FlowMatchEulerScheduler, calculate_shift, rescale_noise_cfg, retrieve_timesteps
 
 logger = get_logger(__name__)
@@ -116,6 +118,51 @@ def denormalize_audio_latents(latents, latents_mean, latents_std):
     return (latents * latents_std) + latents_mean
 
 
+@dataclasses.dataclass
+class DenoiseStageState:
+    """Everything one denoising stage owns for the length of a request."""
+    settings: GenerationSettings
+    prompt_embeds: torch.Tensor
+    audio_prompt_embeds: torch.Tensor
+    attention_mask: torch.Tensor
+    latents: torch.Tensor
+    audio_latents: torch.Tensor
+    video_coords: torch.Tensor
+    audio_coords: torch.Tensor
+    rotary_emb: tuple
+    latent_num_frames: int
+    latent_height: int
+    latent_width: int
+    audio_num_frames: int
+    timesteps: torch.Tensor
+    scheduler: FlowMatchEulerScheduler
+    audio_scheduler: FlowMatchEulerScheduler
+    step_index: int
+    cache: Optional[ResidualCache]
+    ref_strength_mask_packed: Optional[torch.Tensor]
+    ref_first_frame_tokens: Optional[torch.Tensor]
+    backend_stage: str
+    adapter_strength: float
+
+
+@dataclasses.dataclass
+class GenerationContext:
+    """Everything one request owns between preparation and decode.
+
+    A context is created by preparation, carried through the denoising stages and
+    consumed by decode. Nothing in it is shared with another request, which is what
+    lets the engine hold more than one request's worth of state at once.
+    """
+    settings: GenerationSettings
+    generator: torch.Generator
+    raw_prompt_embeds: Optional[torch.Tensor]
+    raw_prompt_attention_mask: Optional[torch.Tensor]
+    latent_mel_bins: int
+    stage1: DenoiseStageState
+    stage2_noise: Optional[tuple]
+    stage2: Optional[DenoiseStageState] = None
+
+
 class LTX25Pipeline:
     """Generates synchronized video and audio from text by denoising packed latents with
     the transformer and decoding them through the VAEs.
@@ -153,9 +200,11 @@ class LTX25Pipeline:
         self.upsampler = upsampler
         self.device = resolve_device(device)
         self.dtype = dtype or (torch.bfloat16 if self.device.type == "cuda" else torch.float32)
-        self.lora_entries = lora_entries
-        self.connector_lora_entries = connector_lora_entries
-        self.scheduler = FlowMatchEulerScheduler(model_config.scheduler)
+        self.lora_installed = lora_entries is not None and connector_lora_entries is not None
+        if lora_entries is not None:
+            apply_lora(self.transformer, lora_entries)
+        if connector_lora_entries is not None:
+            apply_lora(self.connectors, connector_lora_entries)
         self.vae_spatial_compression_ratio = vae.spatial_compression_ratio
         self.vae_temporal_compression_ratio = vae.temporal_compression_ratio
         self.audio_vae_mel_compression_ratio = audio_vae.mel_compression_ratio
@@ -230,30 +279,42 @@ class LTX25Pipeline:
         latents = normalize_video_latents(latents, self.vae.latents_mean, self.vae.latents_std, self.vae.config.scaling_factor)
         return latents.repeat(1, 1, latent_num_frames, 1, 1)
 
-    def convert_velocity_to_x0(self, sample, velocity_prediction, step_idx, scheduler=None):
+    def convert_velocity_to_x0(self, sample, velocity_prediction, step_idx, scheduler):
         """Converts a velocity prediction to a clean-sample (x0) estimate at the given scheduler step."""
-        if scheduler is None:
-            scheduler = self.scheduler
         return sample - velocity_prediction * scheduler.sigmas[step_idx]
 
-    def convert_x0_to_velocity(self, sample, x0_prediction, step_idx, scheduler=None):
+    def convert_x0_to_velocity(self, sample, x0_prediction, step_idx, scheduler):
         """Converts a clean-sample (x0) estimate back to a velocity prediction at the given scheduler step."""
-        if scheduler is None:
-            scheduler = self.scheduler
         return (sample - x0_prediction) / scheduler.sigmas[step_idx]
 
     def create_stage2_scheduler(self):
         """Builds the stage-2 scheduler copy without dynamic shifting or terminal stretch"""
-        stage2_config = copy.copy(self.scheduler.config)
+        stage2_config = copy.copy(self.model_config.scheduler)
         stage2_config.use_dynamic_shifting = False
         stage2_config.shift_terminal = None
         return FlowMatchEulerScheduler(stage2_config)
 
-    def renoise_packed_latents(self, latents, noise_scale, generator):
-        """Re-noises packed latents with fresh Gaussian noise to seed stage-2 refinement"""
+    def renoise_packed_latents(self, latents, noise_scale, generator, noise=None):
+        """Re-noise packed latents with Gaussian noise to seed stage-2 refinement.
+
+        Args:
+            latents: Packed video or audio latents to re-noise.
+            noise_scale: Fraction of fresh noise mixed into the latents.
+            generator: Request generator used when `noise` was not prepared earlier.
+            noise: Optional request-owned noise prepared before the denoising stages.
+
+        Returns:
+            The re-noised latents.
+        """
         if not 0.0 < float(noise_scale) <= 1.0:
             raise ValueError(f"noise_scale must be in (0, 1], got {noise_scale}.")
-        noise = torch.randn(latents.shape, generator=generator, device=latents.device, dtype=torch.float32)
+        if noise is None:
+            noise = torch.randn(
+                latents.shape,
+                generator=generator,
+                device=latents.device,
+                dtype=torch.float32,
+            )
         return noise_scale * noise + (1 - noise_scale) * latents
 
     def _denoise_stage(
@@ -277,6 +338,8 @@ class LTX25Pipeline:
         ref_first_frame_tokens=None,
         rotary_emb=None,
         cache=None,
+        step_index=0,
+        max_steps=None,
     ):
         """Run the transformer denoising loop over packed latents.
 
@@ -318,7 +381,9 @@ class LTX25Pipeline:
             dtype=torch.float32,
         )
         video_keyframes_mask[:, :tokens_per_frame] = 1.0
-        for i, t in enumerate(timesteps):
+        end_step = len(timesteps) if max_steps is None else min(step_index + max_steps, len(timesteps))
+        for i in range(step_index, end_step):
+            t = timesteps[i]
             if cache is not None:
                 cache.begin_step(i)
             captured_states = {}
@@ -495,22 +560,30 @@ class LTX25Pipeline:
         return latents, audio_latents
 
     @torch.no_grad()
-    def generate(self, settings=None):
-        """Generates synchronized video and audio from settings through denoising, optional upsampling, and VAE decoding."""
+    def prepare(self, settings=None):
+        """Validates a request, builds everything it owns, and returns its context.
+
+        This builds the coarse stage and draws the request's noise, including the noise
+        needed by optional refinement. The refinement state is built at the stage boundary,
+        after the coarse latents exist.
+        """
         if settings is None:
             settings = self.config.generation
-
-        
         if settings.height % 32 != 0 or settings.width % 32 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 32 but are {settings.height} and {settings.width}.")
         if not 0.0 <= settings.image_strength <= 1.0:
             raise ValueError(f"`image_strength` must be in [0, 1], got {settings.image_strength}.")
-        device = self.device
-        generator = torch.Generator(device=device).manual_seed(settings.seed)
         if not isinstance(settings.prompt, str) or not settings.prompt.strip():
             raise ValueError("`prompt` must be a single non-empty string.")
         if not isinstance(settings.negative_prompt, str):
             raise ValueError("`negative_prompt` must be a single string, not a list.")
+        if settings.higher_resolution:
+            if self.upsampler is None:
+                raise ValueError("higher_resolution is enabled but no upsampler is loaded.")
+            if not self.lora_installed:
+                raise ValueError("higher_resolution is enabled but no stage-2 LoRA weights are installed.")
+        device = self.device
+        generator = torch.Generator(device=device).manual_seed(settings.seed)
         prompt_embeds, prompt_attention_mask = self.encode_text(settings.prompt, settings.max_sequence_length)
         raw_prompt_embeds, raw_prompt_attention_mask = prompt_embeds, prompt_attention_mask
         negative_prompt_embeds, negative_prompt_attention_mask = self.encode_text(
@@ -528,7 +601,6 @@ class LTX25Pipeline:
         # A request may provide a duration; otherwise the duration head predicts one.
         # Both paths share the same clamping and nearest-grid resolution, so an
         # explicit request and an automatic prediction cannot drift apart.
-
         if settings.duration_seconds is None:
             if self.duration_head is None:
                 raise ValueError(
@@ -540,6 +612,10 @@ class LTX25Pipeline:
             logger.debug(f"Predicted duration {requested_seconds:.2f}s")
         else:
             requested_seconds = settings.duration_seconds
+        try:
+            requested_seconds = float(requested_seconds)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"duration must be a real number of seconds, got {requested_seconds!r}.") from error
         if requested_seconds < self.min_seconds or requested_seconds > self.max_seconds:
             logger.warning(
                 f"Duration {float(requested_seconds):.2f}s outside [{self.min_seconds:.2f}s, {self.max_seconds:.2f}s], "
@@ -624,18 +700,19 @@ class LTX25Pipeline:
         # The shift parameter mu is taken at the maximum sequence anchor and shared
         # by the video and audio schedulers.
         mu = calculate_shift(
-            self.scheduler.config.max_image_seq_len,
-            self.scheduler.config.base_image_seq_len,
-            self.scheduler.config.max_image_seq_len,
-            self.scheduler.config.base_shift,
-            self.scheduler.config.max_shift,
+            self.model_config.scheduler.max_image_seq_len,
+            self.model_config.scheduler.base_image_seq_len,
+            self.model_config.scheduler.max_image_seq_len,
+            self.model_config.scheduler.base_shift,
+            self.model_config.scheduler.max_shift,
         )
-        audio_scheduler = self.scheduler.clone()
+        scheduler = FlowMatchEulerScheduler(self.model_config.scheduler)
+        audio_scheduler = FlowMatchEulerScheduler(self.model_config.scheduler)
         retrieve_timesteps(audio_scheduler, num_inference_steps, device, sigmas=sigmas, mu=mu)
         timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler, num_inference_steps, device, sigmas=sigmas, mu=mu
+            scheduler, num_inference_steps, device, sigmas=sigmas, mu=mu
         )
-        self.scheduler.set_begin_index(0)
+        scheduler.set_begin_index(0)
         audio_scheduler.set_begin_index(0)
         logger.debug(f"Denoising steps: {num_inference_steps}, timesteps: {timesteps[:4].tolist()}...")
         video_coords = self.transformer.rope.prepare_video_coords(
@@ -660,201 +737,315 @@ class LTX25Pipeline:
             total_blocks=len(self.transformer.transformer_blocks),
             decision_pass="cfg",
         )
-        latents, audio_latents = self._denoise_stage(
-            settings,
-            latents,
-            audio_latents,
-            connector_prompt_embeds,
-            connector_audio_prompt_embeds,
-            connector_attention_mask,
-            video_coords,
-            audio_coords,
-            latent_num_frames,
-            latent_height,
-            latent_width,
-            audio_num_frames,
-            self.scheduler,
-            audio_scheduler,
-            timesteps,
-            ref_strength_mask_packed,
-            ref_first_frame_tokens,
-            rotary_emb=rotary_emb,
-            cache=cache,
-        )
-        # Clearing here releases the cached tensors before the refine pass allocates its
-        # larger token grid.
-        cache.reset("end of stage 1")
+        # Refinement noise is drawn here, in the same order and with the same shapes the
+        # refinement stage would have drawn it with, so the sampler sees the same noise
+        # sequence whether the request runs through the engine or through `generate`.
+        stage2_noise = None
         if settings.higher_resolution:
-            if self.upsampler is None:
-                raise ValueError("higher_resolution is enabled but no upsampler is loaded.")
-            if self.lora_entries is None:
-                raise ValueError("higher_resolution is enabled but no stage-2 LoRA weights are loaded.")
-            if self.connector_lora_entries is None:
-                raise ValueError("higher_resolution is enabled but no stage-2 connector LoRA weights are loaded.")
-            # Stage 2 refines from a short three-value sigma schedule, and the distilled
-            # model runs it without any guidance stage.
-            stage2_settings = stage2_generation_settings(settings)
-            stage2_sigmas = STAGE_2_SIGMA_FALLBACK
-            logger.debug(f"Stage 2 sigmas: {stage2_sigmas}")
-            stage1_video = denormalize_video_latents(
-                unpack_video_latents(
-                    latents,
-                    latent_num_frames,
-                    latent_height,
-                    latent_width,
-                    self.transformer_spatial_patch_size,
-                    self.transformer_temporal_patch_size,
-                ),
-                self.vae.latents_mean,
-                self.vae.latents_std,
-                self.vae.config.scaling_factor,
+            refined_tokens = (
+                (latent_num_frames // self.transformer_temporal_patch_size)
+                * ((latent_height * 2) // self.transformer_spatial_patch_size)
+                * ((latent_width * 2) // self.transformer_spatial_patch_size)
             )
-            logger.debug(f"Upsampling stage-1 latents {tuple(stage1_video.shape)}")
-            upsampler_dtype = next(self.upsampler.parameters()).dtype
-            upsampled_video = self.upsampler(stage1_video.to(upsampler_dtype))
-
-            # The stage-2 upsampler only doubles spatial resolution, not time
-            # (temporal_upsample=False in its config). So height and width double here
-            # while the frame count stays exactly as stage 1 produced it.
-
-            latent_height = latent_height * 2
-            latent_width = latent_width * 2
-            stage2_video = normalize_video_latents(
-                upsampled_video,
-                self.vae.latents_mean,
-                self.vae.latents_std,
-                self.vae.config.scaling_factor,
-            )
-            latents = pack_video_latents(
-                stage2_video,
-                self.transformer_spatial_patch_size,
-                self.transformer_temporal_patch_size,
-            )
-            stage2_ref_strength_mask_packed = None
-            stage2_ref_first_frame_tokens = None
-            # Image conditioning pins frame 0 in both stages. Stage 2 runs at twice
-            # the pixel resolution, so the source image is encoded again at that
-            # resolution instead of reusing the coarser stage-1 frame.
-            if ref_strength_mask_packed is not None:
-                stage2_ref_strength_mask = torch.zeros(
-                    (1, 1, latent_num_frames, latent_height, latent_width),
+            stage2_noise = (
+                torch.randn(
+                    (1, refined_tokens, self.transformer.config.in_channels),
+                    generator=generator,
                     device=device,
                     dtype=torch.float32,
-                )
-                stage2_ref_strength_mask[:, :, 0] = settings.image_strength
-                stage2_ref_strength_mask_packed = pack_video_latents(
-                    stage2_ref_strength_mask,
-                    self.transformer_spatial_patch_size,
-                    self.transformer_temporal_patch_size,
-                ).squeeze(-1)
-                stage2_reference_image_latents = self.encode_reference_image(
-                    settings.image_path,
-                    settings.height * 2,
-                    settings.width * 2,
-                    latent_num_frames,
-                    device,
-                )
-                stage2_ref_first_frame_tokens = pack_video_latents(
-                    stage2_reference_image_latents[:, :, :1],
-                    self.transformer_spatial_patch_size,
-                    self.transformer_temporal_patch_size,
-                ).squeeze(0)
-                logger.debug(
-                    f"Stage-2 image conditioning: mask {tuple(stage2_ref_strength_mask_packed.shape)}, "
-                    f"reference tokens {tuple(stage2_ref_first_frame_tokens.shape)} encoded at "
-                    f"{settings.height * 2}x{settings.width * 2}"
-                )
-            noise_scale = stage2_sigmas[0]
-            latents = self.renoise_packed_latents(latents, noise_scale, generator)
-            # Renoise would otherwise erase the pinned first frame before stage 2 starts.
-            if stage2_ref_strength_mask_packed is not None:
-                tokens_per_frame = latents.shape[1] // latent_num_frames
-                latents[:, :tokens_per_frame] = (
-                    settings.image_strength * stage2_ref_first_frame_tokens
-                    + (1 - settings.image_strength) * latents[:, :tokens_per_frame]
-                )
-            # Refinement is a super-resolution pass over the picture and produces no audio
-            # of its own, so `audio_latents` keeps the stage-1 result. The audio stream
-            # still has to run, because the video branch cross-attends to it: the stage-2
-            # stream lives in its own variable and is thrown away with the latents the
-            # refine pass returns.
-            logger.debug(f"Stage 2 keeps the stage-1 audio latents {tuple(audio_latents.shape)}")
-            stage2_audio_latents = self.renoise_packed_latents(audio_latents, noise_scale, generator)
-            stage2_scheduler = self.create_stage2_scheduler()
-            stage2_audio_scheduler = self.create_stage2_scheduler()
-            stage2_timesteps, _ = retrieve_timesteps(stage2_scheduler, len(stage2_sigmas), device, sigmas=stage2_sigmas)
-            retrieve_timesteps(stage2_audio_scheduler, len(stage2_sigmas), device, sigmas=stage2_sigmas)
-            stage2_scheduler.set_begin_index(0)
-            stage2_audio_scheduler.set_begin_index(0)
-            logger.debug(f"Stage 2 steps: {len(stage2_timesteps)}")
-            video_coords = self.transformer.rope.prepare_video_coords(
-                latents.shape[0],
-                latent_num_frames,
-                latent_height,
-                latent_width,
-                latents.device,
-                fps=self.frame_rate,
+                ),
+                torch.randn(audio_latents.shape, generator=generator, device=device, dtype=torch.float32),
             )
-            audio_coords = self.transformer.audio_rope.prepare_audio_coords(
-                stage2_audio_latents.shape[0], audio_num_frames, stage2_audio_latents.device
+            logger.debug(
+                f"Prepared refinement noise: {tuple(stage2_noise[0].shape)} video, "
+                f"{tuple(stage2_noise[1].shape)} audio"
             )
-            # Stage 2 runs at twice the spatial resolution, so it needs its own tables;
-            # rebuilding here releases the stage-1 ones.
-            rotary_emb = self.transformer.prepare_rotary_embeddings(
-                video_coords, audio_coords, latents.device, stage2_audio_latents.device
+        stage1 = DenoiseStageState(
+            settings=settings,
+            prompt_embeds=connector_prompt_embeds,
+            audio_prompt_embeds=connector_audio_prompt_embeds,
+            attention_mask=connector_attention_mask,
+            latents=latents,
+            audio_latents=audio_latents,
+            video_coords=video_coords,
+            audio_coords=audio_coords,
+            rotary_emb=rotary_emb,
+            latent_num_frames=latent_num_frames,
+            latent_height=latent_height,
+            latent_width=latent_width,
+            audio_num_frames=audio_num_frames,
+            timesteps=timesteps,
+            scheduler=scheduler,
+            audio_scheduler=audio_scheduler,
+            step_index=0,
+            cache=cache,
+            ref_strength_mask_packed=ref_strength_mask_packed,
+            ref_first_frame_tokens=ref_first_frame_tokens,
+            backend_stage="stage1",
+            adapter_strength=0.0,
+        )
+        return GenerationContext(
+            settings=settings,
+            generator=generator,
+            raw_prompt_embeds=raw_prompt_embeds if settings.higher_resolution else None,
+            raw_prompt_attention_mask=raw_prompt_attention_mask if settings.higher_resolution else None,
+            latent_mel_bins=latent_mel_bins,
+            stage1=stage1,
+            stage2_noise=stage2_noise,
+        )
+
+    @torch.no_grad()
+    def run_stage_one_step(self, context):
+        """Runs one complete coarse-stage sampler step and returns whether it finished."""
+        stage = context.stage1
+        if stage.step_index >= len(stage.timesteps):
+            raise RuntimeError("The coarse denoising stage has already finished.")
+        stage.latents, stage.audio_latents = self._run_denoise_stage(stage, max_steps=1)
+        stage.step_index += 1
+        if stage.step_index == len(stage.timesteps):
+            stage.cache.reset("end of stage 1")
+            return True
+        return False
+
+    @torch.no_grad()
+    def transition_to_stage_two(self, context):
+        """Reshapes a finished coarse stage into the refinement stage's larger grid.
+
+        This is the barrier between the two denoising stages. The coarse latents are
+        upsampled and renoised, the reference image is encoded again at the refined
+        resolution, and the refinement stage's sampler instances and tables are built.
+        Nothing from the coarse stage survives it, which is what makes the fourfold
+        increase in token count safe.
+        """
+        settings = context.settings
+        stage1 = context.stage1
+        stage2_settings = stage2_generation_settings(settings)
+        stage2_sigmas = STAGE_2_SIGMA_FALLBACK
+        logger.debug(f"Stage 2 sigmas: {stage2_sigmas}")
+        stage1_video = denormalize_video_latents(
+            unpack_video_latents(
+                stage1.latents,
+                stage1.latent_num_frames,
+                stage1.latent_height,
+                stage1.latent_width,
+                self.transformer_spatial_patch_size,
+                self.transformer_temporal_patch_size,
+            ),
+            self.vae.latents_mean,
+            self.vae.latents_std,
+            self.vae.config.scaling_factor,
+        )
+        logger.debug(f"Upsampling stage-1 latents {tuple(stage1_video.shape)}")
+        upsampler_dtype = next(self.upsampler.parameters()).dtype
+        upsampled_video = self.upsampler(stage1_video.to(upsampler_dtype))
+        # The stage-2 upsampler only doubles spatial resolution, not time
+        # (temporal_upsample=False in its config), so height and width double here
+        # while the frame count stays exactly as stage 1 produced it.
+        latent_height = stage1.latent_height * 2
+        latent_width = stage1.latent_width * 2
+        stage2_video = normalize_video_latents(
+            upsampled_video,
+            self.vae.latents_mean,
+            self.vae.latents_std,
+            self.vae.config.scaling_factor,
+        )
+        latents = pack_video_latents(
+            stage2_video,
+            self.transformer_spatial_patch_size,
+            self.transformer_temporal_patch_size,
+        )
+        # The coarse grid, its rotary tables, and its schedulers are no longer needed
+        # once the refined latents have been formed. Drop them before allocating the
+        # larger refinement tables so the transition does not retain both grids.
+        stage1.latents = None
+        stage1.video_coords = None
+        stage1.audio_coords = None
+        stage1.rotary_emb = None
+        stage1.timesteps = None
+        stage1.scheduler = None
+        stage1.audio_scheduler = None
+        stage1.cache = None
+        stage1.prompt_embeds = None
+        stage1.audio_prompt_embeds = None
+        stage1.attention_mask = None
+        del stage1_video, upsampled_video, stage2_video
+        # Image conditioning pins frame 0 in both stages. Stage 2 runs at twice
+        # the pixel resolution, so the source image is encoded again at that
+        # resolution instead of reusing the coarser stage-1 frame.
+        stage2_ref_strength_mask_packed = None
+        stage2_ref_first_frame_tokens = None
+        if stage1.ref_strength_mask_packed is not None:
+            stage2_ref_strength_mask = torch.zeros(
+                (1, 1, stage1.latent_num_frames, latent_height, latent_width),
+                device=self.device,
+                dtype=torch.float32,
             )
-            connector_lora_originals = apply_lora(
-                self.connectors, self.connector_lora_entries, scale=settings.stage2_lora_strength
+            stage2_ref_strength_mask[:, :, 0] = settings.image_strength
+            stage2_ref_strength_mask_packed = pack_video_latents(
+                stage2_ref_strength_mask,
+                self.transformer_spatial_patch_size,
+                self.transformer_temporal_patch_size,
+            ).squeeze(-1)
+            stage2_reference_image_latents = self.encode_reference_image(
+                settings.image_path,
+                settings.height * 2,
+                settings.width * 2,
+                stage1.latent_num_frames,
+                self.device,
             )
-            try:
-                # The refine pass has no negative branch, so only the positive prompt
-                # goes through the LoRA-adapted connectors.
-                (
-                    stage2_connector_prompt_embeds,
-                    stage2_connector_audio_prompt_embeds,
-                    stage2_connector_attention_mask,
-                ) = self.connectors(raw_prompt_embeds, raw_prompt_attention_mask, padding_side="left")
-                lora_originals = apply_lora(
-                    self.transformer, self.lora_entries, scale=settings.stage2_lora_strength
-                )
-                try:
-                    latents, _ = self._denoise_stage(
-                        stage2_settings,
-                        latents,
-                        stage2_audio_latents,
-                        stage2_connector_prompt_embeds,
-                        stage2_connector_audio_prompt_embeds,
-                        stage2_connector_attention_mask,
-                        video_coords,
-                        audio_coords,
-                        latent_num_frames,
-                        latent_height,
-                        latent_width,
-                        audio_num_frames,
-                        stage2_scheduler,
-                        stage2_audio_scheduler,
-                        stage2_timesteps,
-                        stage2_ref_strength_mask_packed,
-                        stage2_ref_first_frame_tokens,
-                        rotary_emb=rotary_emb,
-                        cache=None,
-                    )
-                finally:
-                    remove_lora(lora_originals)
-            finally:
-                remove_lora(connector_lora_originals)
-        latents = unpack_video_latents(
-            latents,
-            latent_num_frames,
+            stage2_ref_first_frame_tokens = pack_video_latents(
+                stage2_reference_image_latents[:, :, :1],
+                self.transformer_spatial_patch_size,
+                self.transformer_temporal_patch_size,
+            ).squeeze(0)
+            logger.debug(
+                f"Stage-2 image conditioning: mask {tuple(stage2_ref_strength_mask_packed.shape)}, "
+                f"reference tokens {tuple(stage2_ref_first_frame_tokens.shape)} encoded at "
+                f"{settings.height * 2}x{settings.width * 2}"
+            )
+        stage1.ref_strength_mask_packed = None
+        stage1.ref_first_frame_tokens = None
+        noise_scale = stage2_sigmas[0]
+        latents = self.renoise_packed_latents(latents, noise_scale, None, context.stage2_noise[0])
+        # Renoise would otherwise erase the pinned first frame before stage 2 starts.
+        if stage2_ref_strength_mask_packed is not None:
+            tokens_per_frame = latents.shape[1] // stage1.latent_num_frames
+            latents[:, :tokens_per_frame] = (
+                settings.image_strength * stage2_ref_first_frame_tokens
+                + (1 - settings.image_strength) * latents[:, :tokens_per_frame]
+            )
+        # Refinement is a super-resolution pass over the picture and produces no audio
+        # of its own, so the coarse result stays the request's audio. The audio stream
+        # still has to run, because the video branch cross-attends to it: the stage-2
+        # stream lives in the stage's own latents and is thrown away with them.
+        logger.debug(f"Stage 2 keeps the stage-1 audio latents {tuple(stage1.audio_latents.shape)}")
+        stage2_audio_latents = self.renoise_packed_latents(
+            stage1.audio_latents, noise_scale, None, context.stage2_noise[1]
+        )
+        context.stage2_noise = None
+        stage2_scheduler = self.create_stage2_scheduler()
+        stage2_audio_scheduler = self.create_stage2_scheduler()
+        stage2_timesteps, _ = retrieve_timesteps(
+            stage2_scheduler, len(stage2_sigmas), self.device, sigmas=stage2_sigmas
+        )
+        retrieve_timesteps(stage2_audio_scheduler, len(stage2_sigmas), self.device, sigmas=stage2_sigmas)
+        stage2_scheduler.set_begin_index(0)
+        stage2_audio_scheduler.set_begin_index(0)
+        logger.debug(f"Stage 2 steps: {len(stage2_timesteps)}")
+        video_coords = self.transformer.rope.prepare_video_coords(
+            latents.shape[0],
+            stage1.latent_num_frames,
             latent_height,
             latent_width,
+            self.device,
+            fps=self.frame_rate,
+        )
+        audio_coords = self.transformer.audio_rope.prepare_audio_coords(
+            stage2_audio_latents.shape[0], stage1.audio_num_frames, stage2_audio_latents.device
+        )
+        # Stage 2 runs at twice the spatial resolution, so it needs its own tables;
+        # building them here releases the stage-1 ones with the coarse stage state.
+        rotary_emb = self.transformer.prepare_rotary_embeddings(
+            video_coords, audio_coords, self.device, stage2_audio_latents.device
+        )
+        # The refine pass has no negative branch, so only the positive prompt goes
+        # through the adapter-strengthened connectors.
+        with lora_strength(stage2_settings.stage2_lora_strength):
+            (
+                stage2_connector_prompt_embeds,
+                stage2_connector_audio_prompt_embeds,
+                stage2_connector_attention_mask,
+            ) = self.connectors(
+                context.raw_prompt_embeds,
+                context.raw_prompt_attention_mask,
+                padding_side="left",
+            )
+        context.raw_prompt_embeds = None
+        context.raw_prompt_attention_mask = None
+        context.stage2 = DenoiseStageState(
+            settings=stage2_settings,
+            prompt_embeds=stage2_connector_prompt_embeds,
+            audio_prompt_embeds=stage2_connector_audio_prompt_embeds,
+            attention_mask=stage2_connector_attention_mask,
+            latents=latents,
+            audio_latents=stage2_audio_latents,
+            video_coords=video_coords,
+            audio_coords=audio_coords,
+            rotary_emb=rotary_emb,
+            latent_num_frames=stage1.latent_num_frames,
+            latent_height=latent_height,
+            latent_width=latent_width,
+            audio_num_frames=stage1.audio_num_frames,
+            timesteps=stage2_timesteps,
+            scheduler=stage2_scheduler,
+            audio_scheduler=stage2_audio_scheduler,
+            step_index=0,
+            cache=None,
+            ref_strength_mask_packed=stage2_ref_strength_mask_packed,
+            ref_first_frame_tokens=stage2_ref_first_frame_tokens,
+            backend_stage="stage2",
+            adapter_strength=stage2_settings.stage2_lora_strength,
+        )
+        logger.info(
+            f"Refinement stage prepared: {latents.shape[1]} video tokens at {latent_height}x{latent_width}, "
+            f"{len(stage2_timesteps)} steps"
+        )
+
+    @torch.no_grad()
+    def run_stage_two_step(self, context):
+        """Runs one complete refinement sampler step and returns whether it finished."""
+        stage = context.stage2
+        if stage is None:
+            raise RuntimeError("The refinement stage was asked to run before its transition.")
+        if stage.step_index >= len(stage.timesteps):
+            raise RuntimeError("The refinement denoising stage has already finished.")
+        stage.latents, _ = self._run_denoise_stage(stage, max_steps=1)
+        stage.step_index += 1
+        return stage.step_index == len(stage.timesteps)
+
+    def _run_denoise_stage(self, stage, max_steps=None):
+        """Runs one denoising stage with the attention scope and adapter strength it owns."""
+        with lora_strength(stage.adapter_strength), stage_backends(stage.backend_stage):
+            return self._denoise_stage(
+                stage.settings,
+                stage.latents,
+                stage.audio_latents,
+                stage.prompt_embeds,
+                stage.audio_prompt_embeds,
+                stage.attention_mask,
+                stage.video_coords,
+                stage.audio_coords,
+                stage.latent_num_frames,
+                stage.latent_height,
+                stage.latent_width,
+                stage.audio_num_frames,
+                stage.scheduler,
+                stage.audio_scheduler,
+                stage.timesteps,
+                stage.ref_strength_mask_packed,
+                stage.ref_first_frame_tokens,
+                rotary_emb=stage.rotary_emb,
+                cache=stage.cache,
+                step_index=stage.step_index,
+                max_steps=max_steps,
+            )
+
+    @torch.no_grad()
+    def decode(self, context):
+        """Decodes a finished request's latents into a video and a waveform."""
+        final = context.stage2 if context.stage2 is not None else context.stage1
+        latents = unpack_video_latents(
+            final.latents,
+            final.latent_num_frames,
+            final.latent_height,
+            final.latent_width,
             self.transformer_spatial_patch_size,
             self.transformer_temporal_patch_size,
         )
         audio_latents = denormalize_audio_latents(
-            audio_latents, self.audio_vae.latents_mean, self.audio_vae.latents_std
+            context.stage1.audio_latents, self.audio_vae.latents_mean, self.audio_vae.latents_std
         )
-        audio_latents = unpack_audio_latents(audio_latents, latent_mel_bins)
+        audio_latents = unpack_audio_latents(audio_latents, context.latent_mel_bins)
         latents = denormalize_video_latents(
             latents, self.vae.latents_mean, self.vae.latents_std, self.vae.config.scaling_factor
         )
@@ -865,16 +1056,16 @@ class LTX25Pipeline:
         # across calls.
 
         offloaded = []
-        for module in [self.text_encoder, self.transformer, self.connectors, self.upsampler, self.duration_head]:
-            if module is not None:
-                module.to("cpu")
-                offloaded.append(module)
         try:
+            for module in [self.text_encoder, self.transformer, self.connectors, self.upsampler, self.duration_head]:
+                if module is not None:
+                    module.to("cpu")
+                    offloaded.append(module)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             logger.debug(f"Decoding video latents {tuple(latents.shape)}")
             vae_dtype = next(self.vae.parameters()).dtype
-            video = self.vae.decode(latents.to(vae_dtype))
+            video = self.vae.decode(latents.to(vae_dtype), generator=context.generator)
             audio_latents = audio_latents.to(next(self.audio_vae.parameters()).dtype)
             generated_mel = self.audio_vae.decode(audio_latents)
             logger.debug(f"Decoding audio mel {tuple(generated_mel.shape)}")
@@ -885,11 +1076,21 @@ class LTX25Pipeline:
             if self.device.type == "cuda":
                 torch.backends.cudnn.deterministic = True
             try:
-                with torch.autocast(device_type=self.device.type, dtype=torch.float32):
-                    audio = self.vocoder(generated_mel.float())
+                audio = self.vocoder(generated_mel.float())
             finally:
                 torch.backends.cudnn.deterministic = previous_cudnn_deterministic
         finally:
             for module in offloaded:
-                module.to(device)
+                module.to(self.device)
         return video, audio
+
+    def generate(self, settings=None):
+        """Generates synchronized video and audio through denoising, optional upsampling, and VAE decoding."""
+        context = self.prepare(settings)
+        while not self.run_stage_one_step(context):
+            pass
+        if context.settings.higher_resolution:
+            self.transition_to_stage_two(context)
+            while not self.run_stage_two_step(context):
+                pass
+        return self.decode(context)

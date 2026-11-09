@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.model.attention_backend import SHARED, VIDEO_SELF, attention
 from src.model.common import PixArtAlphaCombinedTimestepSizeEmbeddings
 
 def apply_interleaved_rotary_emb(x, freqs):
@@ -111,6 +112,7 @@ class LTX2Attention(nn.Module):
         norm_elementwise_affine=True,
         rope_type="interleaved",
         apply_gated_attention=False,
+        layer_role=SHARED,
     ):
         super().__init__()
         if qk_norm != "rms_norm_across_heads":
@@ -122,6 +124,9 @@ class LTX2Attention(nn.Module):
         self.cross_attention_dim = cross_attention_dim if cross_attention_dim is not None else query_dim
         self.heads = heads
         self.rope_type = rope_type
+        # What this module attends over. The backend policy only differentiates the video
+        # self-attention shapes from everything else, which needs no further distinction.
+        self.layer_role = layer_role
         self.norm_q = torch.nn.RMSNorm(dim_head * heads, eps=norm_eps, elementwise_affine=norm_elementwise_affine)
         self.norm_k = torch.nn.RMSNorm(dim_head * kv_heads, eps=norm_eps, elementwise_affine=norm_elementwise_affine)
         self.to_q = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
@@ -207,8 +212,8 @@ class LTX2Attention(nn.Module):
                 key, key_rotary_emb if key_rotary_emb is not None else query_rotary_emb
             )
         value_reshaped = value.unflatten(2, (self.heads, -1)).transpose(1, 2)
-        hidden_states = F.scaled_dot_product_attention(
-            query, key, value_reshaped, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        hidden_states = attention(
+            query, key, value_reshaped, attention_mask, role=self.layer_role
         )
         hidden_states = hidden_states.transpose(1, 2).flatten(2, 3).to(query.dtype)
         if perturbation_mask is not None:
@@ -270,6 +275,7 @@ class LTX2VideoTransformerBlock(nn.Module):
             qk_norm=qk_norm,
             rope_type=rope_type,
             apply_gated_attention=video_gated_attn,
+            layer_role=VIDEO_SELF,
         )
         self.audio_norm1 = nn.RMSNorm(audio_dim, eps=eps, elementwise_affine=elementwise_affine)
         self.audio_attn1 = LTX2Attention(
@@ -1061,7 +1067,10 @@ class VideoTransformer(nn.Module):
             if block_idx == capture_block:
                 # What a block receives is the whole prefix's contribution, so keeping it is what lets
                 # the following pass skip that prefix instead of recomputing it.
-                captured_states["state"] = (hidden_states[-1:], audio_hidden_states[-1:])
+                captured_states["state"] = (
+                    hidden_states[-1:].clone(),
+                    audio_hidden_states[-1:].clone(),
+                )
             block_perturbation_mask = perturbation_mask if block_idx in stg_blocks else None
             block_all_perturbed = all_perturbed if block_idx in stg_blocks else False
             hidden_states, audio_hidden_states = block(

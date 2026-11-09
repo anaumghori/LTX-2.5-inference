@@ -130,8 +130,8 @@ class ResidualCache:
                 self._consecutive_reused_steps += 1
             else:
                 self._consecutive_reused_steps = 0
-        state.leading_video = positive_video.detach()
-        state.leading_audio = positive_audio.detach()
+        state.leading_video = positive_video.detach().clone()
+        state.leading_audio = positive_audio.detach().clone()
         return reuse
 
     def cached_residual(self):

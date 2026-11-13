@@ -1,13 +1,10 @@
 import dataclasses
 import json
 from pathlib import Path
-import torch
 from huggingface_hub import snapshot_download
+from safetensors import safe_open
 from safetensors.torch import load_file
-from transformers import AutoModel, AutoTokenizer
 
-from src.model.common import resolve_device
-from src.model.conditioning import DurationHead, TextConnectors
 from src.model.config import (
     AudioVAEConfig,
     ConnectorConfig,
@@ -22,12 +19,6 @@ from src.model.config import (
 )
 from src.model.logging_utils import get_logger
 from src.model.lora import parse_lora_state_dict
-from src.model.transformer import VideoTransformer
-from src.model.audio_vae import AudioVAE
-from src.model.upsampler import LatentUpsampler
-from src.model.video_vae import VideoVAE
-from src.model.vocoder import Vocoder
-
 
 logger = get_logger(__name__)
 
@@ -112,6 +103,26 @@ def safetensors_state_dict(folder):
     return state
 
 
+def safetensors_subset(folder, keys, name):
+    folder = Path(folder)
+    files = sorted(folder.glob("*.safetensors"))
+    if not files:
+        raise ValueError(f"No .safetensors files found in {folder}")
+    state = {}
+    stored = 0
+    for file in files:
+        with safe_open(str(file), framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                stored += 1
+                if key in keys:
+                    state[key] = handle.get_tensor(key)
+    logger.info(
+        f"{name}: read {len(state)} of {stored} stored tensors from {folder}, "
+        f"the rest belongs to the other half"
+    )
+    return state
+
+
 def strict_load(module, state, name):
     """Load weights into a module and fail loudly on any mismatch.
 
@@ -152,109 +163,39 @@ def download_checkpoint(repo_id, revision, token):
     return Path(local_dir)
 
 
-def load_pipeline_from_checkpoint(engine_config=None, checkpoint_dir=None, device=None, dtype=None):
-    """Build the full pipeline by loading every component from a checkpoint.
+def resolve_checkpoint(engine_config, checkpoint_dir=None):
+    """The local checkpoint directory, downloading it when none was given."""
+    if checkpoint_dir is not None:
+        return Path(checkpoint_dir)
+    project_root = Path(__file__).resolve().parent.parent.parent
+    token = read_hf_token(project_root / ".env")
+    return download_checkpoint(engine_config.repo_id, engine_config.repo_revision, token)
 
-    Components that the current settings do not need are skipped, so loading
-    stays fast and memory stays low: the upsampler and stage-2 LoRA weights
-    are only loaded when those features are enabled. The duration head is
-    always loaded, so automatic duration stays available for any request, not
-    just the first one.
 
-    Args:
-        engine_config: Engine configuration: repository, revision, and generation settings.
-        checkpoint_dir: Local checkpoint path. Downloaded when omitted.
-        device: Device on which to place the models.
-        dtype: Precision used for the model weights.
+def load_model_configs(engine_config=None, checkpoint_dir=None):
+    """Read every component's architecture from the checkpoint without loading weights.
 
-    Returns:
-        The ready-to-run pipeline.
+    The engine reads these to decide where to cut the block stack, which it has to know
+    before either worker starts, so nothing here allocates a model.
     """
-    from src.model.pipeline import LTX25Pipeline
     if engine_config is None:
         engine_config = EngineConfig()
-    device = resolve_device(device)
-    if dtype is None:
-        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-    logger.info(f"Using device {device} with dtype {dtype}")
-    if checkpoint_dir is None:
-        project_root = Path(__file__).resolve().parent.parent.parent
-        token = read_hf_token(project_root / ".env")
-        checkpoint_dir = download_checkpoint(engine_config.repo_id, engine_config.repo_revision, token)
-    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir = resolve_checkpoint(engine_config, checkpoint_dir)
     logger.info(f"Checkpoint directory: {checkpoint_dir}")
     transformer_dir = resolve_subfolder(checkpoint_dir, ["transformer_full"])
     transformer_config = build_component_config(TransformerConfig, transformer_dir, "transformer")
-    transformer = VideoTransformer(transformer_config).to(device=device, dtype=dtype)
-    strict_load(transformer, safetensors_state_dict(transformer_dir), "transformer")
-    transformer.eval()
-    tokenizer_dir = resolve_subfolder(checkpoint_dir, ["tokenizer"])
-    tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir))
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    tokenizer.padding_side = "left"
-    text_encoder_dir = resolve_subfolder(checkpoint_dir, ["text_encoder"])
-    text_encoder = AutoModel.from_pretrained(str(text_encoder_dir), dtype=dtype)
-    text_encoder.to(device=device)
-    text_encoder.eval()
-
     connectors_dir = resolve_subfolder(checkpoint_dir, ["connectors"])
     connectors_config = build_component_config(ConnectorConfig, connectors_dir, "connectors")
-    connectors = TextConnectors(connectors_config).to(device=device, dtype=dtype)
-    strict_load(connectors, safetensors_state_dict(connectors_dir), "connectors")
-    connectors.eval()
-
     vae_dir = resolve_subfolder(checkpoint_dir, ["vae"])
     vae_config = build_component_config(VideoVAEConfig, vae_dir, "vae")
-    vae = VideoVAE(vae_config).to(device=device, dtype=dtype)
-    strict_load(vae, safetensors_state_dict(vae_dir), "vae")
-    vae.eval()
-
     audio_vae_dir = resolve_subfolder(checkpoint_dir, ["audio_vae"])
     audio_vae_config = build_component_config(AudioVAEConfig, audio_vae_dir, "audio_vae")
-    audio_vae = AudioVAE(audio_vae_config, with_encoder=False).to(device=device, dtype=dtype)
-    audio_vae_state = safetensors_state_dict(audio_vae_dir)
-    # Only the decoder side is ever run, so encoder weights are dropped before loading rather than kept resident
-    skipped_encoder_keys = [key for key in audio_vae_state if key.startswith("encoder.")]
-    decoder_state = {key: value for key, value in audio_vae_state.items() if not key.startswith("encoder.")}
-    logger.info(f"Skipping {len(skipped_encoder_keys)} audio encoder weights (audio input deferred)")
-    strict_load(audio_vae, decoder_state, "audio_vae")
-    audio_vae.eval()
-
     vocoder_dir = resolve_subfolder(checkpoint_dir, ["vocoder"])
     vocoder_config = build_component_config(VocoderConfig, vocoder_dir, "vocoder")
-    vocoder = Vocoder(vocoder_config).to(device=device, dtype=dtype)
-    strict_load(vocoder, safetensors_state_dict(vocoder_dir), "vocoder")
-    vocoder.eval()
-
     duration_head_dir = checkpoint_dir / "duration_head"
     duration_head_config = build_component_config(DurationHeadConfig, duration_head_dir, "duration_head")
-    duration_head = DurationHead(duration_head_config).to(device=device, dtype=dtype)
-    strict_load(duration_head, safetensors_state_dict(duration_head_dir), "duration_head")
-    duration_head.eval()
-
     upsampler_dir = checkpoint_dir / "latent_upsampler"
     upsampler_config = build_component_config(UpsamplerConfig, upsampler_dir, "upsampler")
-    upsampler = None
-
-    if engine_config.generation.higher_resolution:
-        upsampler = LatentUpsampler(upsampler_config).to(device=device, dtype=dtype)
-        strict_load(upsampler, safetensors_state_dict(upsampler_dir), "upsampler")
-        upsampler.eval()
-    else:
-        logger.info("higher_resolution is disabled, skipping upsampler weights")
-    lora_entries = None
-    connector_lora_entries = None
-
-    if engine_config.generation.higher_resolution:
-        lora_files = sorted(checkpoint_dir.glob("*lora*.safetensors"))
-        if not lora_files:
-            raise ValueError("higher_resolution is enabled but no LoRA weight file exists at the checkpoint root.")
-        if len(lora_files) > 1:
-            raise ValueError(f"higher_resolution needs one stage-2 LoRA file but found several: {lora_files}")
-        logger.info(f"Loading stage-2 LoRA file {lora_files[0]}")
-        lora_entries, connector_lora_entries = parse_lora_state_dict(load_file(str(lora_files[0]), device="cpu"))
     scheduler_dir = resolve_subfolder(checkpoint_dir, ["scheduler"])
     scheduler_config = build_component_config(
         SchedulerConfig, scheduler_dir, "scheduler", filename="scheduler_config.json"
@@ -262,8 +203,6 @@ def load_pipeline_from_checkpoint(engine_config=None, checkpoint_dir=None, devic
     # The checkpoint ships sampling values tuned for the distilled few-step path, so
     # re-enable length-adaptive shifting for full-model denoising.
     scheduler_config = dataclasses.replace(scheduler_config, use_dynamic_shifting=True, shift_terminal=0.1)
-    logger.debug(f"Scheduler settings in effect: {dataclasses.asdict(scheduler_config)}")
-
     model_config = ModelConfig(
         transformer=transformer_config,
         connectors=connectors_config,
@@ -274,21 +213,20 @@ def load_pipeline_from_checkpoint(engine_config=None, checkpoint_dir=None, devic
         duration_head=duration_head_config,
         upsampler=upsampler_config,
     )
-    pipeline = LTX25Pipeline(
-        model_config=model_config,
-        engine_config=engine_config,
-        transformer=transformer,
-        tokenizer=tokenizer,
-        text_encoder=text_encoder,
-        connectors=connectors,
-        vae=vae,
-        audio_vae=audio_vae,
-        vocoder=vocoder,
-        duration_head=duration_head,
-        upsampler=upsampler,
-        device=device,
-        dtype=dtype,
-        lora_entries=lora_entries,
-        connector_lora_entries=connector_lora_entries,
-    )
-    return pipeline
+    return model_config, checkpoint_dir
+
+
+def load_stage2_adapters(checkpoint_dir, engine_config):
+    """Parse the stage-2 LoRA file into its transformer and connector halves."""
+    if not engine_config.generation.higher_resolution:
+        logger.info("higher_resolution is disabled, skipping stage-2 LoRA weights")
+        return None, None
+    lora_files = sorted(Path(checkpoint_dir).glob("*lora*.safetensors"))
+    if not lora_files:
+        raise ValueError("higher_resolution is enabled but no LoRA weight file exists at the checkpoint root.")
+    if len(lora_files) > 1:
+        raise ValueError(f"higher_resolution needs one stage-2 LoRA file but found several: {lora_files}")
+    logger.info(f"Loading stage-2 LoRA file {lora_files[0]}")
+    return parse_lora_state_dict(load_file(str(lora_files[0]), device="cpu"))
+
+

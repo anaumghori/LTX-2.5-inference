@@ -280,3 +280,12 @@ class EngineConfig:
     min_seconds: float = 1.0
     max_seconds: float = 20.0
     generation: GenerationSettings = field(default_factory=GenerationSettings)
+    # The two devices the model is split across, and how many requests may be resident
+    # in the pipeline at once. One request per lane runs across both devices.
+    front_device: int = 0
+    back_device: int = 1
+    lane_count: int = 2
+    # How long a worker may wait for the other worker's message before the pipeline is
+    # declared stuck, and how long startup may take before the engine gives up.
+    message_timeout_seconds: float = 90.0
+    startup_timeout_seconds: float = 1800.0

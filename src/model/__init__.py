@@ -1,3 +1,1 @@
-from src.model.pipeline import LTX25Pipeline
-from src.model.weights import load_pipeline_from_checkpoint
-from src.model.config import EngineConfig
+"""The model itself: the transformer, the VAEs, the text connectors and the weights they load."""

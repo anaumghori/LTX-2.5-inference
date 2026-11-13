@@ -1,3 +1,4 @@
+import contextlib
 import math
 import torch
 import torch.nn as nn
@@ -11,6 +12,16 @@ def resolve_device(device=None):
     if device.type == "cuda" and device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
     return device
+
+
+@contextlib.contextmanager
+def default_float_dtype(dtype):
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(previous)
 
 
 def timestep_frequencies(embedding_dim, downscale_freq_shift=1, max_period=10000, device=None):

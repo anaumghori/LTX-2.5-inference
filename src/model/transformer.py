@@ -1,3 +1,5 @@
+import dataclasses
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -721,45 +723,178 @@ class RotaryPosEmbed(nn.Module):
         return cos_freqs, sin_freqs
 
 
-class VideoTransformer(nn.Module):
-    """Joint video-audio diffusion transformer.
-
-    Packed video and audio latents are projected inward, conditioned on text and
-    timestep, refined through the joint blocks, then projected back to velocity
-    predictions for both modalities.
-    """
-    def __init__(self, config):
+class _ForeignBlock(nn.Module):
+    def __init__(self, index):
         super().__init__()
+        self.index = index
+
+    def forward(self, *args, **kwargs):
+        raise RuntimeError(f"Block {self.index} is held by the other half and cannot run here.")
+
+# A pass sends its conditioning in two parts with different lifetimes. The timestep-derived
+# part changes every step; the prompt-derived part does not change within a stage at a given
+# batch, so a stage sends it once and every later pass rebuilds it from the receiver's copy.
+STEP_CONDITIONING_TENSORS = 10
+STAGE_CONDITIONING_TENSORS = 4
+
+@dataclasses.dataclass
+class PassConditioning:
+    """Every value a pass's blocks need, derived once by the GPU that builds the pass input."""
+    temb: torch.Tensor
+    temb_audio: torch.Tensor
+    embedded_timestep: torch.Tensor
+    audio_embedded_timestep: torch.Tensor
+    temb_prompt: Optional[torch.Tensor]
+    temb_prompt_audio: Optional[torch.Tensor]
+    temb_ca_scale_shift: torch.Tensor
+    temb_ca_audio_scale_shift: torch.Tensor
+    temb_ca_gate: torch.Tensor
+    temb_ca_audio_gate: torch.Tensor
+    encoder_hidden_states: torch.Tensor
+    audio_encoder_hidden_states: torch.Tensor
+    encoder_attention_mask: Optional[torch.Tensor]
+    audio_encoder_attention_mask: Optional[torch.Tensor]
+
+    def step_tensors(self, device, dtype):
+        """The conditioning that changes with the step, empty where a value is absent."""
+        def present(tensor):
+            return torch.empty(0, device=device, dtype=dtype) if tensor is None else tensor
+
+        return (
+            self.temb,
+            self.temb_audio,
+            self.embedded_timestep,
+            self.audio_embedded_timestep,
+            present(self.temb_prompt),
+            present(self.temb_prompt_audio),
+            self.temb_ca_scale_shift,
+            self.temb_ca_audio_scale_shift,
+            self.temb_ca_gate,
+            self.temb_ca_audio_gate,
+        )
+
+    def stage_tensors(self, device, dtype):
+        """The conditioning that follows the prompt alone, so one stage sends it once."""
+        def present(tensor):
+            return torch.empty(0, device=device, dtype=dtype) if tensor is None else tensor
+
+        return (
+            self.encoder_hidden_states,
+            self.audio_encoder_hidden_states,
+            present(self.encoder_attention_mask),
+            present(self.audio_encoder_attention_mask),
+        )
+
+    def positive_branch(self):
+        """The conditioning of the positive sample, which the guidance passes run alone"""
+        def last(tensor):
+            return None if tensor is None else tensor[-1:]
+
+        return PassConditioning(
+            temb=last(self.temb),
+            temb_audio=last(self.temb_audio),
+            embedded_timestep=last(self.embedded_timestep),
+            audio_embedded_timestep=last(self.audio_embedded_timestep),
+            temb_prompt=last(self.temb_prompt),
+            temb_prompt_audio=last(self.temb_prompt_audio),
+            temb_ca_scale_shift=last(self.temb_ca_scale_shift),
+            temb_ca_audio_scale_shift=last(self.temb_ca_audio_scale_shift),
+            temb_ca_gate=last(self.temb_ca_gate),
+            temb_ca_audio_gate=last(self.temb_ca_audio_gate),
+            encoder_hidden_states=last(self.encoder_hidden_states),
+            audio_encoder_hidden_states=last(self.audio_encoder_hidden_states),
+            encoder_attention_mask=last(self.encoder_attention_mask),
+            audio_encoder_attention_mask=last(self.audio_encoder_attention_mask),
+        )
+
+    @classmethod
+    def from_tensors(cls, step, stage):
+        """Rebuild the conditioning from the step-varying and stage-constant parts."""
+        if len(step) != STEP_CONDITIONING_TENSORS:
+            raise ValueError(
+                f"A pass carries {len(step)} step conditioning tensors, expected "
+                f"{STEP_CONDITIONING_TENSORS}."
+            )
+        if len(stage) != STAGE_CONDITIONING_TENSORS:
+            raise ValueError(
+                f"A stage conditioning payload holds {len(stage)} tensors, expected "
+                f"{STAGE_CONDITIONING_TENSORS}."
+            )
+
+        def absent(tensor):
+            return None if tensor.numel() == 0 else tensor
+
+        return cls(
+            temb=step[0],
+            temb_audio=step[1],
+            embedded_timestep=step[2],
+            audio_embedded_timestep=step[3],
+            temb_prompt=absent(step[4]),
+            temb_prompt_audio=absent(step[5]),
+            temb_ca_scale_shift=step[6],
+            temb_ca_audio_scale_shift=step[7],
+            temb_ca_gate=step[8],
+            temb_ca_audio_gate=step[9],
+            encoder_hidden_states=stage[0],
+            audio_encoder_hidden_states=stage[1],
+            encoder_attention_mask=absent(stage[2]),
+            audio_encoder_attention_mask=absent(stage[3]),
+        )
+
+
+class VideoTransformer(nn.Module):
+    def __init__(self, config, *, block_range, with_input=True, with_output=True):
+        """Build one GPU side of the transformer.
+
+        Only the components this side owns are constructed, so a worker never materialises
+        the other side's weights, even briefly.
+        """
+        super().__init__()
+        if block_range.step != 1 or len(block_range) < 1:
+            raise ValueError(f"block_range must be a contiguous slice of at least one block, got {block_range}.")
+        if with_input and block_range.start != 0:
+            raise ValueError("Only the half that owns the top of the stack can hold the input machinery.")
+        if with_output and block_range.stop != config.num_layers:
+            raise ValueError("Only the half that owns the end of the stack can hold the output projections.")
         self.config = config
+        self.block_range = block_range
+        self.with_input = with_input
+        self.with_output = with_output
         inner_dim = config.num_attention_heads * config.attention_head_dim
         audio_inner_dim = config.audio_num_attention_heads * config.audio_attention_head_dim
         out_channels = config.out_channels or config.in_channels
         audio_out_channels = config.audio_out_channels or config.audio_in_channels
-        self.proj_in = nn.Linear(config.in_channels, inner_dim)
-        self.audio_proj_in = nn.Linear(config.audio_in_channels, audio_inner_dim)
-        if config.use_keyframes_abs_pos_embedding:
-            self.keyframes_abs_pos_embedding = nn.Parameter(torch.zeros(1, inner_dim))
-        if config.use_prompt_embeddings:
-            self.caption_projection = PixArtAlphaTextProjection(
-                in_features=config.caption_channels, hidden_size=inner_dim
-            )
-            self.audio_caption_projection = PixArtAlphaTextProjection(
-                in_features=config.caption_channels, hidden_size=audio_inner_dim
-            )
-        self.prompt_modulation = config.cross_attn_mod or config.audio_cross_attn_mod
-        video_time_emb_mod_params = 9 if config.cross_attn_mod else 6
-        audio_time_emb_mod_params = 9 if config.audio_cross_attn_mod else 6
-        self.time_embed = AdaLayerNormSingle(inner_dim, num_mod_params=video_time_emb_mod_params)
-        self.audio_time_embed = AdaLayerNormSingle(audio_inner_dim, num_mod_params=audio_time_emb_mod_params)
-        self.av_cross_attn_video_scale_shift = AdaLayerNormSingle(inner_dim, num_mod_params=4)
-        self.av_cross_attn_audio_scale_shift = AdaLayerNormSingle(audio_inner_dim, num_mod_params=4)
-        self.av_cross_attn_video_a2v_gate = AdaLayerNormSingle(inner_dim, num_mod_params=1)
-        self.av_cross_attn_audio_v2a_gate = AdaLayerNormSingle(audio_inner_dim, num_mod_params=1)
-        self.scale_shift_table = nn.Parameter(torch.randn(2, inner_dim) / inner_dim**0.5)
-        self.audio_scale_shift_table = nn.Parameter(torch.randn(2, audio_inner_dim) / audio_inner_dim**0.5)
-        if self.prompt_modulation and config.use_prompt_adaln_single:
-            self.prompt_adaln = AdaLayerNormSingle(inner_dim, num_mod_params=2)
-            self.audio_prompt_adaln = AdaLayerNormSingle(audio_inner_dim, num_mod_params=2)
+        if with_input:
+            self.proj_in = nn.Linear(config.in_channels, inner_dim)
+            self.audio_proj_in = nn.Linear(config.audio_in_channels, audio_inner_dim)
+            if config.use_keyframes_abs_pos_embedding:
+                self.keyframes_abs_pos_embedding = nn.Parameter(torch.zeros(1, inner_dim))
+            if config.use_prompt_embeddings:
+                self.caption_projection = PixArtAlphaTextProjection(
+                    in_features=config.caption_channels, hidden_size=inner_dim
+                )
+                self.audio_caption_projection = PixArtAlphaTextProjection(
+                    in_features=config.caption_channels, hidden_size=audio_inner_dim
+                )
+            self.prompt_modulation = config.cross_attn_mod or config.audio_cross_attn_mod
+            video_time_emb_mod_params = 9 if config.cross_attn_mod else 6
+            audio_time_emb_mod_params = 9 if config.audio_cross_attn_mod else 6
+            self.time_embed = AdaLayerNormSingle(inner_dim, num_mod_params=video_time_emb_mod_params)
+            self.audio_time_embed = AdaLayerNormSingle(audio_inner_dim, num_mod_params=audio_time_emb_mod_params)
+            self.av_cross_attn_video_scale_shift = AdaLayerNormSingle(inner_dim, num_mod_params=4)
+            self.av_cross_attn_audio_scale_shift = AdaLayerNormSingle(audio_inner_dim, num_mod_params=4)
+            self.av_cross_attn_video_a2v_gate = AdaLayerNormSingle(inner_dim, num_mod_params=1)
+            self.av_cross_attn_audio_v2a_gate = AdaLayerNormSingle(audio_inner_dim, num_mod_params=1)
+            if self.prompt_modulation and config.use_prompt_adaln_single:
+                self.prompt_adaln = AdaLayerNormSingle(inner_dim, num_mod_params=2)
+                self.audio_prompt_adaln = AdaLayerNormSingle(audio_inner_dim, num_mod_params=2)
+        if with_output:
+            self.scale_shift_table = nn.Parameter(torch.randn(2, inner_dim) / inner_dim**0.5)
+            self.audio_scale_shift_table = nn.Parameter(torch.randn(2, audio_inner_dim) / audio_inner_dim**0.5)
+            self.norm_out = nn.LayerNorm(inner_dim, eps=1e-6, elementwise_affine=False)
+            self.proj_out = nn.Linear(inner_dim, out_channels)
+            self.audio_norm_out = nn.LayerNorm(audio_inner_dim, eps=1e-6, elementwise_affine=False)
+            self.audio_proj_out = nn.Linear(audio_inner_dim, audio_out_channels)
         self.rope = RotaryPosEmbed(
             dim=inner_dim,
             patch_size=config.patch_size,
@@ -844,12 +979,10 @@ class VideoTransformer(nn.Module):
                 audio_ff_bias=config.audio_ff_bias,
                 activation_fn=config.activation_fn,
             )
-            for _ in range(config.num_layers)
+            if index in block_range
+            else _ForeignBlock(index)
+            for index in range(config.num_layers)
         ])
-        self.norm_out = nn.LayerNorm(inner_dim, eps=1e-6, elementwise_affine=False)
-        self.proj_out = nn.Linear(inner_dim, out_channels)
-        self.audio_norm_out = nn.LayerNorm(audio_inner_dim, eps=1e-6, elementwise_affine=False)
-        self.audio_proj_out = nn.Linear(audio_inner_dim, audio_out_channels)
 
     def prepare_rotary_embeddings(self, video_coords, audio_coords, video_device, audio_device):
         """Build the video, audio and cross-modal rotary tables for one position set.
@@ -861,96 +994,28 @@ class VideoTransformer(nn.Module):
             self.cross_attn_audio_rope(audio_coords[:, 0:1, :], device=audio_device),
         )
 
-    def forward(
+    @torch.no_grad()
+    def run_input(
         self,
         hidden_states,
         audio_hidden_states,
+        *,
+        timestep,
+        sigma,
         encoder_hidden_states,
         audio_encoder_hidden_states,
-        timestep,
         audio_timestep=None,
-        sigma=None,
         audio_sigma=None,
         encoder_attention_mask=None,
         audio_encoder_attention_mask=None,
-        num_frames=None,
-        height=None,
-        width=None,
-        fps=24.0,
-        audio_num_frames=None,
-        video_coords=None,
-        audio_coords=None,
-        rotary_emb=None,
-        isolate_modalities=False,
-        spatio_temporal_guidance_blocks=None,
-        perturbation_mask=None,
-        use_cross_timestep=False,
-        video_self_attention_mask=None,
         video_keyframes_mask=None,
-        cache=None,
-        start_block=None,
-        start_states=None,
-        capture_block=None,
-        captured_states=None,
+        use_cross_timestep=True,
     ):
-        """Denoise packed video and audio latents by one transformer pass.
-
-        Args:
-            hidden_states: Packed video latents.
-            audio_hidden_states: Packed audio latents.
-            encoder_hidden_states: Video text conditioning.
-            audio_encoder_hidden_states: Audio text conditioning.
-            timestep: Video timestep per batch entry.
-            audio_timestep: Audio timestep per batch entry. Falls back to the video one.
-            sigma: Video sigma per batch entry, used for prompt modulation.
-            audio_sigma: Audio sigma per batch entry. Falls back to the video one.
-            encoder_attention_mask: Mask for video text attention.
-            audio_encoder_attention_mask: Mask for audio text attention.
-            num_frames: Latent video frame count, used when building coordinates.
-            height: Latent video height, used when building coordinates.
-            width: Latent video width, used when building coordinates.
-            fps: Frame rate used for the time coordinates.
-            audio_num_frames: Latent audio frame count, used when building coordinates.
-            video_coords: Prebuilt video coordinates. Built when omitted.
-            audio_coords: Prebuilt audio coordinates. Built when omitted.
-            rotary_emb: Tables from prepare_rotary_embeddings. Built when omitted.
-            isolate_modalities: Disable cross-modal attention for guidance.
-            spatio_temporal_guidance_blocks: Block indices running perturbed attention.
-            perturbation_mask: Per-token attention weakening for guidance.
-            use_cross_timestep: Modulate each modality with the other stream's time.
-            video_self_attention_mask: Mask for video self-attention.
-            video_keyframes_mask: Marks keyframe tokens for extra position signal.
-            cache: Optional step cache that may replace the middle of the block stack with the
-                residual it holds from the last step that ran in full.
-            start_block: Index of the first block to run. Must be at least 1, because block 0
-                produces the state the cache compares against.
-            start_states: The video and audio states to begin the stack with.
-            capture_block: Index of a block whose incoming state is recorded, for a later pass to start from.
-            captured_states: Mapping that receives the captured state under the key "state".
-
-        Returns:
-            The video and audio velocity predictions.
-        """
+        """Project this pass's latents and derive every value its blocks need"""
+        if not self.with_input:
+            raise RuntimeError("This half does not hold the transformer's input machinery.")
         config = self.config
-        block_count = len(self.transformer_blocks)
-        if start_states is not None and start_block is None:
-            raise ValueError("start_states needs the block index it belongs to, so start_block is required.")
-        if start_block is not None:
-            if not 0 < start_block < block_count:
-                raise ValueError(f"start_block must fall between 1 and {block_count - 1}, got {start_block}.")
-            if start_states is None:
-                raise ValueError(f"start_block {start_block} was given without the states to begin the stack with.")
-            if cache is not None:
-                # The cache holds the state entering the leading blocks and what the blocks after them
-                # add, so it has nothing to say about a pass that never runs that part of the stack.
-                raise ValueError("A pass that starts inside the stack cannot take the residual cache.")
-        if capture_block is not None:
-            if not 0 < capture_block < block_count:
-                raise ValueError(f"capture_block must fall between 1 and {block_count - 1}, got {capture_block}.")
-            if captured_states is None:
-                raise ValueError("capture_block was given without a captured_states mapping to record it in.")
-            if start_block is not None:
-                raise ValueError("A pass that starts inside the stack cannot capture a block it already passed.")
+        batch_size = hidden_states.size(0)
         audio_timestep = audio_timestep if audio_timestep is not None else timestep
         audio_sigma = audio_sigma if audio_sigma is not None else sigma
         if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
@@ -959,32 +1024,13 @@ class VideoTransformer(nn.Module):
         if audio_encoder_attention_mask is not None and audio_encoder_attention_mask.ndim == 2:
             audio_encoder_attention_mask = (1 - audio_encoder_attention_mask.to(audio_hidden_states.dtype)) * -10000.0
             audio_encoder_attention_mask = audio_encoder_attention_mask.unsqueeze(1)
-        if video_self_attention_mask is not None:
-            video_self_attention_mask = (1 - video_self_attention_mask.to(hidden_states.dtype)) * -10000.0
-        batch_size = hidden_states.size(0)
-        if video_coords is None:
-            video_coords = self.rope.prepare_video_coords(
-                batch_size, num_frames, height, width, hidden_states.device, fps=fps
-            )
-        if audio_coords is None:
-            audio_coords = self.audio_rope.prepare_audio_coords(
-                batch_size, audio_num_frames, audio_hidden_states.device
-            )
-        if rotary_emb is None:
-            rotary_emb = self.prepare_rotary_embeddings(
-                video_coords, audio_coords, hidden_states.device, audio_hidden_states.device
-            )
-        video_rotary_emb, audio_rotary_emb, video_cross_attn_rotary_emb, audio_cross_attn_rotary_emb = rotary_emb
-        if start_states is None:
-            hidden_states = self.proj_in(hidden_states)
-            audio_hidden_states = self.audio_proj_in(audio_hidden_states)
-            if config.use_keyframes_abs_pos_embedding and video_keyframes_mask is not None:
-                # Keyframe tokens get an extra learned marker so the model can tell
-                # reference frames apart from freely generated ones.
-                marker = (video_keyframes_mask > 0).to(dtype=hidden_states.dtype)
-                hidden_states = hidden_states + marker * self.keyframes_abs_pos_embedding.to(dtype=hidden_states.dtype)
-        else:
-            hidden_states, audio_hidden_states = start_states
+        hidden_states = self.proj_in(hidden_states)
+        audio_hidden_states = self.audio_proj_in(audio_hidden_states)
+        if config.use_keyframes_abs_pos_embedding and video_keyframes_mask is not None:
+            # Keyframe tokens get an extra learned marker so the model can tell
+            # reference frames apart from freely generated ones.
+            marker = (video_keyframes_mask > 0).to(dtype=hidden_states.dtype)
+            hidden_states = hidden_states + marker * self.keyframes_abs_pos_embedding.to(dtype=hidden_states.dtype)
         timestep_cross_attn_gate_scale_factor = (
             config.cross_attn_timestep_scale_multiplier / config.timestep_scale_multiplier
         )
@@ -1030,40 +1076,97 @@ class VideoTransformer(nn.Module):
             encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.size(-1))
             audio_encoder_hidden_states = self.audio_caption_projection(audio_encoder_hidden_states)
             audio_encoder_hidden_states = audio_encoder_hidden_states.view(batch_size, -1, audio_hidden_states.size(-1))
-        spatio_temporal_guidance_blocks = spatio_temporal_guidance_blocks or []
-        if len(spatio_temporal_guidance_blocks) > 0 and perturbation_mask is None:
+        return hidden_states, audio_hidden_states, PassConditioning(
+            temb=temb,
+            temb_audio=temb_audio,
+            embedded_timestep=embedded_timestep,
+            audio_embedded_timestep=audio_embedded_timestep,
+            temb_prompt=temb_prompt,
+            temb_prompt_audio=temb_prompt_audio,
+            temb_ca_scale_shift=video_cross_attn_scale_shift,
+            temb_ca_audio_scale_shift=audio_cross_attn_scale_shift,
+            temb_ca_gate=video_cross_attn_a2v_gate,
+            temb_ca_audio_gate=audio_cross_attn_v2a_gate,
+            encoder_hidden_states=encoder_hidden_states,
+            audio_encoder_hidden_states=audio_encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            audio_encoder_attention_mask=audio_encoder_attention_mask,
+        )
+
+    @torch.no_grad()
+    def run_blocks(
+        self,
+        hidden_states,
+        audio_hidden_states,
+        *,
+        lo,
+        hi,
+        conditioning,
+        rotary_emb,
+        pass_name,
+        step_index,
+        cache=None,
+        reuse=None,
+        capture_block=None,
+        captured_states=None,
+        perturb_blocks=(),
+        perturbation_mask=None,
+        all_perturbed=False,
+        isolate_modalities=False,
+        video_self_attention_mask=None,
+    ):
+        if not 0 <= lo < hi <= len(self.transformer_blocks):
+            raise ValueError(f"Blocks [{lo}, {hi}) do not fit in a stack of {len(self.transformer_blocks)} blocks.")
+        if cache is not None and reuse is None and not cache.decides:
+            raise ValueError("Only the deciding half may run without a reuse decision; this half replays what it is told.")
+        video_rotary_emb, audio_rotary_emb, video_cross_attn_rotary_emb, audio_cross_attn_rotary_emb = rotary_emb
+        temb = conditioning.temb
+        temb_audio = conditioning.temb_audio
+        temb_prompt = conditioning.temb_prompt
+        temb_prompt_audio = conditioning.temb_prompt_audio
+        video_cross_attn_scale_shift = conditioning.temb_ca_scale_shift
+        audio_cross_attn_scale_shift = conditioning.temb_ca_audio_scale_shift
+        video_cross_attn_a2v_gate = conditioning.temb_ca_gate
+        audio_cross_attn_v2a_gate = conditioning.temb_ca_audio_gate
+        encoder_hidden_states = conditioning.encoder_hidden_states
+        audio_encoder_hidden_states = conditioning.audio_encoder_hidden_states
+        encoder_attention_mask = conditioning.encoder_attention_mask
+        audio_encoder_attention_mask = conditioning.audio_encoder_attention_mask
+        batch_size = hidden_states.size(0)
+        stg_blocks = set(perturb_blocks)
+        if len(stg_blocks) > 0 and perturbation_mask is None:
             # Requesting guidance blocks without an explicit mask means perturbing
             # every batch entry, so start from an all-perturbed default mask.
             perturbation_mask = torch.zeros((batch_size,))
         if perturbation_mask is not None and perturbation_mask.ndim == 1:
             perturbation_mask = perturbation_mask[:, None, None]
-        all_perturbed = bool(torch.all(perturbation_mask == 0)) if perturbation_mask is not None else False
-        stg_blocks = set(spatio_temporal_guidance_blocks)
-        # The cache splits the stack in three: the leading blocks always run and produce the
-        # signal, the middle is either computed or replaced by the residual the last computed
-        # step produced for it, and the trailing blocks always run on top of whatever reaches
-        # them, so the last word on the state is real computation.
-        cache_boundary = cache.boundary_index if cache is not None else None
-        cache_tail = cache.tail_index if cache is not None else None
+        all_perturbed = all_perturbed or (
+            bool(torch.all(perturbation_mask == 0)) if perturbation_mask is not None else False
+        )
+        region_start = cache.replay_start if cache is not None else None
+        region_end = cache.replay_end if cache is not None else None
+        owns_region_start = cache is not None and lo <= region_start < hi
         stack_input = (hidden_states, audio_hidden_states)
-        boundary_states = None
-        tail_states = None
-        middle_reused = False
-        for block_idx in range(0 if start_block is None else start_block, block_count):
+        region_start_states = None
+        region_end_states = None
+        for block_idx in range(lo, hi):
             block = self.transformer_blocks[block_idx]
-            if block_idx == cache_boundary:
-                boundary_states = (hidden_states, audio_hidden_states)
-                middle_reused = cache.should_reuse_middle_blocks(
-                    hidden_states - stack_input[0], audio_hidden_states - stack_input[1]
-                )
-                if middle_reused:
-                    cached_video, cached_audio = cache.cached_residual()
+            if owns_region_start and block_idx == region_start:
+                region_start_states = (hidden_states, audio_hidden_states)
+                if reuse is None:
+                    reuse = cache.decide(
+                        pass_name,
+                        hidden_states - stack_input[0],
+                        audio_hidden_states - stack_input[1],
+                    )
+                if reuse:
+                    cached_video, cached_audio = cache.replay(pass_name)
                     hidden_states = hidden_states + cached_video
                     audio_hidden_states = audio_hidden_states + cached_audio
-            if middle_reused and block_idx < cache_tail:
+            if reuse and cache is not None and block_idx < region_end:
                 continue
-            if not middle_reused and block_idx == cache_tail:
-                tail_states = (hidden_states, audio_hidden_states)
+            if not reuse and cache is not None and block_idx == region_end:
+                region_end_states = (hidden_states, audio_hidden_states)
             if block_idx == capture_block:
                 # What a block receives is the whole prefix's contribution, so keeping it is what lets
                 # the following pass skip that prefix instead of recomputing it.
@@ -1101,12 +1204,30 @@ class VideoTransformer(nn.Module):
                 perturbation_mask=block_perturbation_mask,
                 all_perturbed=block_all_perturbed,
             )
-        if cache is not None and not middle_reused:
-            # Only the middle is stored: the tail recomputes its own contribution on every step,
-            # so including it here would add it on top of itself on a reused step.
-            cache.store_residual(
-                tail_states[0] - boundary_states[0], tail_states[1] - boundary_states[1]
+        if cache is not None and not reuse:
+            if region_start_states is None:
+                raise RuntimeError(f"Pass {pass_name!r} never crossed the cache boundary at block {region_start}.")
+            if region_end_states is None:
+                # The region ends where this side's block range ends, so the state leaving
+                # the loop is its far end.
+                region_end_states = (hidden_states, audio_hidden_states)
+            cache.record(
+                pass_name,
+                step_index,
+                region_end_states[0] - region_start_states[0],
+                region_end_states[1] - region_start_states[1],
             )
+        return hidden_states, audio_hidden_states, bool(reuse)
+
+    def block_state_keys(self):
+        return set(self.state_dict().keys())
+
+    @torch.no_grad()
+    def finalize(self, hidden_states, audio_hidden_states, conditioning):
+        if not self.with_output:
+            raise RuntimeError("This half does not hold the transformer's output projections.")
+        embedded_timestep = conditioning.embedded_timestep
+        audio_embedded_timestep = conditioning.audio_embedded_timestep
         scale_shift_values = self.scale_shift_table[None, None] + embedded_timestep[:, :, None]
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
         hidden_states = self.norm_out(hidden_states)

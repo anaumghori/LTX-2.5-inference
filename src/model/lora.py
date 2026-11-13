@@ -156,9 +156,11 @@ class LoRAAugmentedLinear(nn.Module):
 def apply_lora(root, entries, scale=1.0):
     """Attach LoRA adapters to the matching linear layers of a module.
 
-    Layers with no match are skipped and if too many targets fail to match,
-    every change is rolled back before raising an error, so the model is left
-    exactly as it was found.
+    A target with no matching layer is skipped, because each GPU holds only its own share
+    of the block stack while the adapter covers the whole model. If nothing matches at
+    all, the adapter does not belong to this GPU side and that is an error. A failure
+    partway through puts every already-swapped layer back, so the model is never left
+    with only some of the adapter applied.
 
     Args:
         root: Module whose linear layers should receive adapters.
@@ -195,19 +197,17 @@ def apply_lora(root, entries, scale=1.0):
             setattr(parent, name, base)
         raise
     if skipped:
-        logger.warning(f"LoRA skipped {len(skipped)} targets with no matching module:")
-        for target in skipped[:30]:
-            logger.debug("  skipped LoRA target: " + target)
-    # A small number of misses is expected across checkpoint variants, but matching fewer
-    # than half the targets usually means the wrong adapter is being applied, so roll back
-    # everything instead of leaving a partially adapted model.
-    if len(originals) * 2 < len(entries):
-        for parent, name, base in originals:
-            setattr(parent, name, base)
-        raise ValueError(
-            f"LoRA applied to only {len(originals)} of {len(entries)} targets, refusing partial application"
+        logger.debug(
+            f"LoRA skipped {len(skipped)} of {len(entries)} targets that this half does not hold "
+            f"(first: {skipped[0]})"
         )
-    logger.debug(f"Applied LoRA to {len(originals)} linear layers with scale {scale}")
+    if entries and not originals:
+        raise ValueError(
+            f"LoRA matched none of its {len(entries)} targets in this half, so the adapter does not belong to it"
+        )
+    logger.debug(
+        f"Applied LoRA to {len(originals)} of {len(entries)} targets with scale {scale}, {len(skipped)} held by the peer"
+    )
     return originals
 
 

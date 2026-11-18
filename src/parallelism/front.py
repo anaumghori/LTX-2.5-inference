@@ -270,7 +270,11 @@ class FrontHalf(Half):
                 video_keyframes_mask=lane.keyframes_mask,
                 use_cross_timestep=True,
             )
-            reuse = None if plan.name == "cfg" else (lane.step_reuse if plan.cached else False)
+            # Every cached pass has to run its leading blocks and make the decision at the
+            # cache boundary. Telling a follower pass to reuse before it reaches that
+            # boundary makes it skip the leading blocks, which are never part of the stored
+            # residual.
+            reuse = None if plan.cached else False
             hidden_states, audio_hidden_states, reuse = self._blocks(
                 lane,
                 plan,

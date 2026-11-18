@@ -1163,7 +1163,10 @@ class VideoTransformer(nn.Module):
                     cached_video, cached_audio = cache.replay(pass_name)
                     hidden_states = hidden_states + cached_video
                     audio_hidden_states = audio_hidden_states + cached_audio
-            if reuse and cache is not None and block_idx < region_end:
+            # Reuse replaces only the cache's own region. Blocks before it and after it
+            # always run; a pass that receives a reuse decision before the boundary must
+            # not silently skip the leading blocks it has not run yet.
+            if reuse and cache is not None and region_start <= block_idx < region_end:
                 continue
             if not reuse and cache is not None and block_idx == region_end:
                 region_end_states = (hidden_states, audio_hidden_states)

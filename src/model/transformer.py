@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.model.attention_backend import SHARED, VIDEO_SELF, attention
+from src.model.attention_backend import AUDIO_TEXT, SHARED, VIDEO_SELF, VIDEO_TEXT, attention
 from src.model.common import PixArtAlphaCombinedTimestepSizeEmbeddings
 
 def apply_interleaved_rotary_emb(x, freqs):
@@ -31,6 +31,44 @@ def apply_split_rotary_emb(x, freqs):
     first_out.copy_(torch.addcmul(first_x.mul(cos), second_x, sin, value=-1.0))
     second_out.copy_(torch.addcmul(second_x.mul(cos), first_x, sin))
     return out
+
+torch._dynamo.config.recompile_limit = 64
+torch._dynamo.config.accumulated_recompile_limit = 1024
+
+COMPILE_OPTIONS = {
+    "emulate_precision_casts": True,
+    "max_autotune": False,
+    "max_autotune_gemm": False,
+}
+
+
+_NORM_LIBRARY = torch.library.Library("ltx_engine", "FRAGMENT")
+_NORM_LIBRARY.define("native_rms_norm(Tensor x, Tensor? weight, float? eps) -> Tensor")
+
+
+def _native_rms_norm_impl(x, weight, eps):
+    return F.rms_norm(x, (x.shape[-1],), weight, eps)
+
+
+def _native_rms_norm_meta(x, weight, eps):
+    return torch.empty(x.shape, dtype=x.dtype, device=x.device)
+
+
+_NORM_LIBRARY.impl("native_rms_norm", _native_rms_norm_impl, "CompositeExplicitAutograd")
+_NORM_LIBRARY.impl("native_rms_norm", _native_rms_norm_meta, "Meta")
+
+
+def _native_rms_norm(x: torch.Tensor, weight: Optional[torch.Tensor], eps: Optional[float]) -> torch.Tensor:
+    return torch.ops.ltx_engine.native_rms_norm.default(x, weight, eps)
+
+
+def _pinned_rms_norm_forward(self, x):
+    if len(self.normalized_shape) != 1:
+        raise ValueError(f"Only one-dimensional norms are pinned, got {self.normalized_shape}.")
+    return _native_rms_norm(x, self.weight, self.eps)
+
+
+nn.RMSNorm.forward = _pinned_rms_norm_forward
 
 
 class PixArtAlphaTextProjection(nn.Module):
@@ -304,6 +342,7 @@ class LTX2VideoTransformerBlock(nn.Module):
             qk_norm=qk_norm,
             rope_type=rope_type,
             apply_gated_attention=video_gated_attn,
+            layer_role=VIDEO_TEXT,
         )
         self.audio_norm2 = nn.RMSNorm(audio_dim, eps=eps, elementwise_affine=elementwise_affine)
         self.audio_attn2 = LTX2Attention(
@@ -317,6 +356,7 @@ class LTX2VideoTransformerBlock(nn.Module):
             qk_norm=qk_norm,
             rope_type=rope_type,
             apply_gated_attention=audio_gated_attn,
+            layer_role=AUDIO_TEXT,
         )
         self.audio_to_video_norm = nn.RMSNorm(dim, eps=eps, elementwise_affine=elementwise_affine)
         self.audio_to_video_attn = LTX2Attention(
@@ -843,7 +883,7 @@ class PassConditioning:
 
 
 class VideoTransformer(nn.Module):
-    def __init__(self, config, *, block_range, with_input=True, with_output=True):
+    def __init__(self, config, *, block_range, with_input=True, with_output=True, compile_blocks=True):
         """Build one GPU side of the transformer.
 
         Only the components this side owns are constructed, so a worker never materialises
@@ -983,6 +1023,16 @@ class VideoTransformer(nn.Module):
             else _ForeignBlock(index)
             for index in range(config.num_layers)
         ])
+        self.set_compile(compile_blocks)
+
+    def set_compile(self, enabled):
+        """Run the blocks this side owns as compiled graphs, or leave them eager"""
+        self.compiled_blocks = [
+            torch.compile(self.transformer_blocks[index], fullgraph=False, options=COMPILE_OPTIONS)
+            if enabled and index in self.block_range
+            else self.transformer_blocks[index]
+            for index in range(self.config.num_layers)
+        ]
 
     def prepare_rotary_embeddings(self, video_coords, audio_coords, video_device, audio_device):
         """Build the video, audio and cross-modal rotary tables for one position set.
@@ -1150,7 +1200,7 @@ class VideoTransformer(nn.Module):
         region_start_states = None
         region_end_states = None
         for block_idx in range(lo, hi):
-            block = self.transformer_blocks[block_idx]
+            block = self.compiled_blocks[block_idx]
             if owns_region_start and block_idx == region_start:
                 region_start_states = (hidden_states, audio_hidden_states)
                 if reuse is None:

@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Optional
 
+from src.model.fp8 import Fp8Settings
+
 
 @dataclass
 class TransformerConfig:
@@ -285,7 +287,16 @@ class EngineConfig:
     front_device: int = 0
     back_device: int = 1
     lane_count: int = 2
+    # Whether each owned transformer block runs as a compiled graph. Compiling costs a few
+    # minutes on a process's first request and pays back on every later pass, so it is on by
+    # default
+    compile_blocks: bool = True
+    # How the transformer's selected linear layers should run in fp8, or None to keep the
+    # whole model in bf16, which is the arithmetic every recorded output was produced with.
+    fp8: Optional[Fp8Settings] = None
     # How long a worker may wait for the other worker's message before the pipeline is
     # declared stuck, and how long startup may take before the engine gives up.
+    # Compiling a block can hold the other worker waiting for minutes, so a cold compiled
+    # start needs a larger message timeout than steady-state serving does.
     message_timeout_seconds: float = 90.0
     startup_timeout_seconds: float = 1800.0

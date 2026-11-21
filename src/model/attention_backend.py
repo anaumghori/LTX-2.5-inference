@@ -5,16 +5,24 @@ import json
 import platform
 import sys
 from pathlib import Path
+from typing import Optional
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from src.model.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
-# Roles describe what an attention call is for
+# Roles describe what an attention call is for. Each one carries its own kernel policy below,
+# because the paths differ in sequence length, key width and whether a mask is present.
 VIDEO_SELF = "video_self"
+VIDEO_TEXT = "video_text"
+AUDIO_TEXT = "audio_text"
 SHARED = "shared"
+SDPA = "sdpa"
+CUDNN = "cudnn"
+SAGE = "sage"
 SAGE_MODULE = "sageattention"
 SAGE_KERNEL = "sageattn_qk_int8_pv_fp16_cuda"
 # Settings passed to the kernel on every call. "HND" means the tensors are laid out as
@@ -31,6 +39,13 @@ SAGE_COMPUTE_CAPABILITY = (12, 0)
 SAGE_ACCEPTANCE_RELATIVE_ERROR = 0.02
 # The tensor shape used for the GPU check: (batch, heads, tokens, head size).
 SAGE_VERIFICATION_SHAPE = (1, 2, 1024, 128)
+# The video-to-text cuDNN path is checked at its engine width: 32 heads of 128 against 1024
+# prompt tokens, with a one-row bias expanded across heads and queries like the real call.
+CUDNN_VERIFICATION_SHAPE = (2, 32, 1024, 128)
+CUDNN_VERIFICATION_KEYS = 1024
+# cuDNN attention and PyTorch's own choice for a masked call run the same formula in different
+# kernels; anything above this is a different implementation rather than a rounding difference.
+CUDNN_ACCEPTANCE_RELATIVE_ERROR = 0.01
 # The command that installs and checks the kernel, quoted in error messages.
 PREPARE_COMMAND = "uv run python -m scripts.prepare_attention"
 
@@ -38,7 +53,6 @@ WHEEL_DIR = Path(__file__).resolve().parents[2] / "vendor" / "wheels"
 MANIFEST_NAME = "manifest.json"
 
 _stage = contextvars.ContextVar("attention_backend_stage", default="stage1")
-
 
 def environment_identity():
     return {
@@ -70,18 +84,41 @@ def stage_backends(stage):
 
 def resolve_backend(role):
     """The backend a role runs on, given the stage the denoising loop is in."""
-    if role == VIDEO_SELF and _stage.get() == "stage2":
-        return SAGE_KERNEL
-    return "sdpa"
+    if role == VIDEO_SELF:
+        return SAGE if _stage.get() == "stage2" else SDPA
+    if role == VIDEO_TEXT:
+        return CUDNN
+    return SDPA
 
 
 def attention(query, key, value, attn_mask=None, *, role=SHARED):
     """Run one attention call on the backend the policy assigns to its role."""
-    if resolve_backend(role) == "sdpa":
+    backend = resolve_backend(role)
+    if backend == SAGE:
+        return sage_attention(query, key, value, attn_mask)
+    if backend == CUDNN:
+        return cudnn_attention(query, key, value, attn_mask)
+    return F.scaled_dot_product_attention(
+        query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
+    )
+
+
+@torch.library.custom_op("ltx_engine::cudnn_attention", mutates_args=())
+def cudnn_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
         return F.scaled_dot_product_attention(
             query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
         )
-    return sage_attention(query, key, value, attn_mask)
+
+
+@cudnn_attention.register_fake
+def _cudnn_attention_meta(query, key, value, attn_mask):
+    return torch.empty_like(query)
 
 
 def sage_attention(query, key, value, attn_mask=None):
@@ -115,8 +152,8 @@ def sage_kernel():
 
 
 def verify_attention_backends(device):
-    """Prove the stage-2 kernel runs on this device, before any weights are loaded.
-    There is no fallback for stage-2 video self-attention.
+    """Prove the pinned kernels run on this device, before any weights are loaded.
+    Neither stage-2 video self-attention nor video-to-text attention has a fallback.
     """
     device = torch.device(device)
     if device.type != "cuda":
@@ -161,12 +198,18 @@ def verify_attention_backends(device):
             "installed kernel is not the one the engine was validated against."
         )
 
+    masked = _verify_masked_attention(device)
     logger.info(
         "Verified %s %s on %s: relative error %.6f against PyTorch attention",
         SAGE_MODULE,
         getattr(module, "__version__", "unknown"),
         device,
         relative_error,
+    )
+    logger.info(
+        "Verified cuDNN attention on %s: relative error %.6f against PyTorch attention",
+        device,
+        masked,
     )
     return {
         "device": str(device),
@@ -176,6 +219,46 @@ def verify_attention_backends(device):
         "manifest_built_at_utc": manifest["built_at_utc"],
         "relative_error": round(relative_error, 8),
     }
+
+
+def _verify_masked_attention(device):
+    """Prove the pinned mask path on this device and that it agrees with PyTorch's own choice"""
+    batch, heads, tokens, head_dim = CUDNN_VERIFICATION_SHAPE
+    query = torch.randn(
+        (batch, tokens, heads * head_dim), device=device, dtype=torch.bfloat16
+    ).unflatten(2, (heads, head_dim)).transpose(1, 2)
+    key = torch.randn((batch, heads, CUDNN_VERIFICATION_KEYS, head_dim), device=device, dtype=torch.bfloat16)
+    value = torch.randn_like(key)
+    mask = torch.zeros((1, 1, 1, CUDNN_VERIFICATION_KEYS), device=device, dtype=torch.bfloat16).expand(
+        batch, heads, tokens, CUDNN_VERIFICATION_KEYS
+    )
+    output = cudnn_attention(query, key, value, mask)
+    reference = F.scaled_dot_product_attention(
+        query, key, value, attn_mask=mask, dropout_p=0.0, is_causal=False
+    )
+    if not torch.isfinite(output).all():
+        raise RuntimeError(f"cuDNN attention produced non-finite output on {device}")
+    if tuple(output.shape) != CUDNN_VERIFICATION_SHAPE:
+        raise RuntimeError(
+            f"cuDNN attention returned {tuple(output.shape)}, expected {CUDNN_VERIFICATION_SHAPE}"
+        )
+    if output.stride() != query.stride():
+        raise RuntimeError(
+            f"cuDNN attention returned strides {tuple(output.stride())} for a query strided "
+            f"{tuple(query.stride())}; the fake kernel in this module must declare the layout "
+            "the kernel actually writes, or a compiled block stops on its layout assertion."
+        )
+    relative_error = float(
+        (output.float() - reference.float()).abs().mean()
+        / reference.float().abs().mean().clamp_min(1e-8)
+    )
+    if relative_error > CUDNN_ACCEPTANCE_RELATIVE_ERROR:
+        raise RuntimeError(
+            f"cuDNN attention differs from PyTorch's attention by {relative_error:.4f} "
+            f"relative, above the {CUDNN_ACCEPTANCE_RELATIVE_ERROR} acceptance bound; the "
+            "pinned video-to-text kernel is not the one the engine was validated against."
+        )
+    return relative_error
 
 
 def _verified_manifest():

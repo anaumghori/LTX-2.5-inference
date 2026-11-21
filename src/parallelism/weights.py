@@ -5,6 +5,7 @@ from transformers import AutoModel, AutoTokenizer
 from src.model.audio_vae import AudioVAE
 from src.model.common import resolve_device
 from src.model.conditioning import DurationHead, TextConnectors
+from src.model.fp8 import apply_fp8
 from src.model.lora import apply_lora
 from src.model.logging_utils import get_logger
 from src.model.transformer import VideoTransformer
@@ -24,6 +25,19 @@ from src.parallelism.front import FrontHalf
 logger = get_logger(__name__)
 
 
+def _convert_to_fp8(transformer, engine_config, split):
+    """Swap this half's selected bf16 linears for fp8 ones, when the engine config asks for it"""
+    if engine_config.fp8 is None:
+        return
+    report = apply_fp8(transformer, engine_config.fp8, split)
+    totals = report["totals"]
+    logger.info(
+        f"FP8 blocks {report['selected_blocks']}: converted {totals['converted']} layers "
+        f"({totals['weight_gb_before']} GB -> {totals['weight_gb_after']} GB of weights), "
+        f"left {totals['kept']} in bf16"
+    )
+
+
 def load_front_half(model_config, checkpoint_dir, engine_config, split, device=None, dtype=None):
     """Build and load the first GPU's share of the model"""
     checkpoint_dir = Path(checkpoint_dir)
@@ -36,6 +50,7 @@ def load_front_half(model_config, checkpoint_dir, engine_config, split, device=N
         block_range=range(0, split.split_index),
         with_input=True,
         with_output=False,
+        compile_blocks=engine_config.compile_blocks,
     ).to(device=device, dtype=dtype)
     strict_load(
         transformer,
@@ -65,6 +80,7 @@ def load_front_half(model_config, checkpoint_dir, engine_config, split, device=N
         apply_lora(transformer, lora_entries)
     if connector_lora_entries is not None:
         apply_lora(connectors, connector_lora_entries)
+    _convert_to_fp8(transformer, engine_config, split)
     return FrontHalf(
         model_config=model_config,
         engine_config=engine_config,
@@ -92,6 +108,7 @@ def load_back_half(model_config, checkpoint_dir, engine_config, split, device=No
         block_range=range(split.split_index, split.block_count),
         with_input=False,
         with_output=True,
+        compile_blocks=engine_config.compile_blocks,
     ).to(device=device, dtype=dtype)
     strict_load(
         transformer,
@@ -127,6 +144,7 @@ def load_back_half(model_config, checkpoint_dir, engine_config, split, device=No
     lora_entries, connector_lora_entries = load_stage2_adapters(checkpoint_dir, engine_config)
     if lora_entries is not None:
         apply_lora(transformer, lora_entries)
+    _convert_to_fp8(transformer, engine_config, split)
     return BackHalf(
         model_config=model_config,
         engine_config=engine_config,

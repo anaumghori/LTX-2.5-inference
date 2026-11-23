@@ -297,15 +297,11 @@ class VocoderGenerator(nn.Module):
             self.act_out = nn.LeakyReLU()
         self.conv_out = nn.Conv1d(output_channels, out_channels, 7, stride=1, padding=3, bias=final_bias)
 
-    def forward(self, hidden_states, mel_bins_last=True):
-        """Generate a waveform from features laid out as [batch, channels, time, mel bins].
-
-        Pass `mel_bins_last=False` for input that already has time on the last axis.
-        """
+    def forward(self, hidden_states):
+        """Generate a waveform from features laid out as [batch, channels, time, mel bins]."""
         # The generator expects [batch, feature, time], so the mel bins are folded into
         # the feature axis before the first convolution.
-        if mel_bins_last:
-            hidden_states = hidden_states.transpose(2, 3)
+        hidden_states = hidden_states.transpose(2, 3)
         hidden_states = hidden_states.flatten(1, 2)
         hidden_states = self.conv_in(hidden_states)
         for i in range(self.num_upsample_layers):

@@ -1272,9 +1272,6 @@ class VideoTransformer(nn.Module):
             )
         return hidden_states, audio_hidden_states, bool(reuse)
 
-    def block_state_keys(self):
-        return set(self.state_dict().keys())
-
     @torch.no_grad()
     def finalize(self, hidden_states, audio_hidden_states, conditioning):
         if not self.with_output:

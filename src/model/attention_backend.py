@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from src.model.logging_utils import get_logger
+from src.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
@@ -158,9 +158,8 @@ def verify_attention_backends(device):
     device = torch.device(device)
     if device.type != "cuda":
         logger.warning(
-            "Attention verification skipped on %s: the SageAttention kernel is CUDA-only and "
-            "every path runs on PyTorch's attention without it",
-            device,
+            f"Attention verification skipped on {device}: the SageAttention kernel is CUDA-only "
+            "and every path runs on PyTorch's attention without it"
         )
         return {"device": str(device), "verified": False, "reason": "device is not CUDA"}
 
@@ -200,16 +199,11 @@ def verify_attention_backends(device):
 
     masked = _verify_masked_attention(device)
     logger.info(
-        "Verified %s %s on %s: relative error %.6f against PyTorch attention",
-        SAGE_MODULE,
-        getattr(module, "__version__", "unknown"),
-        device,
-        relative_error,
+        f"Verified {SAGE_MODULE} {getattr(module, '__version__', 'unknown')} on {device}: "
+        f"relative error {relative_error:.6f} against PyTorch attention"
     )
     logger.info(
-        "Verified cuDNN attention on %s: relative error %.6f against PyTorch attention",
-        device,
-        masked,
+        f"Verified cuDNN attention on {device}: relative error {masked:.6f} against PyTorch attention"
     )
     return {
         "device": str(device),

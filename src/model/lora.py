@@ -4,7 +4,7 @@ import math
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.model.logging_utils import get_logger
+from src.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
@@ -111,7 +111,7 @@ def parse_lora_state_dict(state):
             connector_entries[target[len("connectors."):]] = pair
         else:
             transformer_entries[target] = pair
-    logger.info(f"Parsed LoRA with {len(transformer_entries)} transformer targets and {len(connector_entries)} connector targets")
+    logger.debug(f"Parsed LoRA with {len(transformer_entries)} transformer targets and {len(connector_entries)} connector targets")
     return transformer_entries, connector_entries
 
 
@@ -166,9 +166,6 @@ def apply_lora(root, entries, scale=1.0):
         root: Module whose linear layers should receive adapters.
         entries: Parsed LoRA entries mapping layer paths to weight pairs.
         scale: Extra multiplier applied on top of each entry's own scale.
-
-    Returns:
-        Records of the replaced layers, for use with `remove_lora`.
     """
     originals = []
     skipped = []
@@ -208,11 +205,3 @@ def apply_lora(root, entries, scale=1.0):
     logger.debug(
         f"Applied LoRA to {len(originals)} of {len(entries)} targets with scale {scale}, {len(skipped)} held by the peer"
     )
-    return originals
-
-
-def remove_lora(originals):
-    """Restore the original layers saved by `apply_lora`."""
-    for parent, name, base in originals:
-        setattr(parent, name, base)
-    logger.debug(f"Removed LoRA from {len(originals)} linear layers")

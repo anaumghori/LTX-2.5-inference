@@ -5,9 +5,6 @@ import numpy as np
 from src.model.common import resolve_num_frames
 from src.model.scheduler import FlowMatchEulerScheduler, calculate_shift, retrieve_timesteps
 
-# Stage-2 refinement runs a distilled three-step schedule. The scheduler appends the
-# terminal zero internally, so no trailing 0.0 belongs here.
-STAGE_2_SIGMA_FALLBACK = [0.909375, 0.725, 0.421875]
 
 def select_positive_branch(tensor, text_guidance):
     """Picks the positive half of a [negative, positive] prompt batch"""
@@ -237,24 +234,22 @@ def _stage_two_config(scheduler_config):
     return stage2_config
 
 
-def stage_two_schedulers(scheduler_config, device):
-    """Build the refinement stage's sampler instances and its fixed three-step schedule."""
+def stage_two_schedulers(scheduler_config, sigmas, device):
+    """Build the refinement stage's sampler instances and its distilled few-step schedule."""
     stage2_config = _stage_two_config(scheduler_config)
     video = FlowMatchEulerScheduler(stage2_config)
     audio = FlowMatchEulerScheduler(stage2_config)
-    timesteps, _ = retrieve_timesteps(video, len(STAGE_2_SIGMA_FALLBACK), device, sigmas=STAGE_2_SIGMA_FALLBACK)
-    retrieve_timesteps(audio, len(STAGE_2_SIGMA_FALLBACK), device, sigmas=STAGE_2_SIGMA_FALLBACK)
+    timesteps, _ = retrieve_timesteps(video, len(sigmas), device, sigmas=sigmas)
+    retrieve_timesteps(audio, len(sigmas), device, sigmas=sigmas)
     video.set_begin_index(0)
     audio.set_begin_index(0)
     return video, audio, timesteps
 
 
-def stage_two_timesteps(scheduler_config, device):
+def stage_two_timesteps(scheduler_config, sigmas, device):
     """The refinement stage's timesteps, for the first GPU, which builds the model input."""
     scheduler = FlowMatchEulerScheduler(_stage_two_config(scheduler_config))
-    timesteps, _ = retrieve_timesteps(
-        scheduler, len(STAGE_2_SIGMA_FALLBACK), device, sigmas=STAGE_2_SIGMA_FALLBACK
-    )
+    timesteps, _ = retrieve_timesteps(scheduler, len(sigmas), device, sigmas=sigmas)
     return timesteps
 
 

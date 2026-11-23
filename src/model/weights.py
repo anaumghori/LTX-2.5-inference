@@ -5,7 +5,7 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from safetensors.torch import load_file
 
-from src.model.config import (
+from src.config import (
     AudioVAEConfig,
     ConnectorConfig,
     DurationHeadConfig,
@@ -17,7 +17,7 @@ from src.model.config import (
     VideoVAEConfig,
     VocoderConfig,
 )
-from src.model.logging_utils import get_logger
+from src.logging_utils import get_logger
 from src.model.lora import parse_lora_state_dict
 
 logger = get_logger(__name__)
@@ -97,9 +97,9 @@ def safetensors_state_dict(folder):
         raise ValueError(f"No .safetensors files found in {folder}")
     state = {}
     for file in files:
-        logger.info(f"Loading weights file {file} ({file.stat().st_size / 1e9:.2f} GB)")
+        logger.debug(f"Loading weights file {file} ({file.stat().st_size / 1e9:.2f} GB)")
         state.update(load_file(str(file), device="cpu"))
-    logger.info(f"Loaded {len(state)} tensors from {folder}")
+    logger.debug(f"Loaded {len(state)} tensors from {folder}")
     return state
 
 
@@ -116,7 +116,7 @@ def safetensors_subset(folder, keys, name):
                 stored += 1
                 if key in keys:
                     state[key] = handle.get_tensor(key)
-    logger.info(
+    logger.debug(
         f"{name}: read {len(state)} of {stored} stored tensors from {folder}, "
         f"the rest belongs to the other half"
     )
@@ -137,7 +137,7 @@ def strict_load(module, state, name):
         for key in list(unexpected)[:20]:
             logger.error(f"  unexpected: {key}")
         raise ValueError(f"Weight mapping failed for {name}: missing={len(missing)} unexpected={len(unexpected)}")
-    logger.info(f"Weights loaded for {name}: {len(state)} tensors")
+    logger.debug(f"Weights loaded for {name}: {len(state)} tensors")
 
 
 def resolve_subfolder(checkpoint_dir, candidates):
@@ -155,7 +155,7 @@ def resolve_subfolder(checkpoint_dir, candidates):
 
 def download_checkpoint(repo_id, revision, token):
     logger.info(f"Downloading checkpoint {repo_id} at revision {revision}")
-    logger.info(f"Requesting {len(DOWNLOAD_PATTERNS)} component patterns, other repo components are not fetched")
+    logger.debug(f"Requesting {len(DOWNLOAD_PATTERNS)} component patterns, other repo components are not fetched")
     local_dir = snapshot_download(
         repo_id=repo_id, revision=revision, token=token, allow_patterns=DOWNLOAD_PATTERNS
     )
@@ -181,7 +181,7 @@ def load_model_configs(engine_config=None, checkpoint_dir=None):
     if engine_config is None:
         engine_config = EngineConfig()
     checkpoint_dir = resolve_checkpoint(engine_config, checkpoint_dir)
-    logger.info(f"Checkpoint directory: {checkpoint_dir}")
+    logger.debug(f"Checkpoint directory: {checkpoint_dir}")
     transformer_dir = resolve_subfolder(checkpoint_dir, ["transformer_full"])
     transformer_config = build_component_config(TransformerConfig, transformer_dir, "transformer")
     connectors_dir = resolve_subfolder(checkpoint_dir, ["connectors"])
@@ -200,9 +200,13 @@ def load_model_configs(engine_config=None, checkpoint_dir=None):
     scheduler_config = build_component_config(
         SchedulerConfig, scheduler_dir, "scheduler", filename="scheduler_config.json"
     )
-    # The checkpoint ships sampling values tuned for the distilled few-step path, so
-    # re-enable length-adaptive shifting for full-model denoising.
-    scheduler_config = dataclasses.replace(scheduler_config, use_dynamic_shifting=True, shift_terminal=0.1)
+    # The checkpoint ships sampling values tuned for the distilled few-step path, so the
+    # coarse stage re-enables length-adaptive shifting from the engine configuration.
+    scheduler_config = dataclasses.replace(
+        scheduler_config,
+        use_dynamic_shifting=engine_config.sampling.use_dynamic_shifting,
+        shift_terminal=engine_config.sampling.shift_terminal,
+    )
     model_config = ModelConfig(
         transformer=transformer_config,
         connectors=connectors_config,
@@ -219,14 +223,14 @@ def load_model_configs(engine_config=None, checkpoint_dir=None):
 def load_stage2_adapters(checkpoint_dir, engine_config):
     """Parse the stage-2 LoRA file into its transformer and connector halves."""
     if not engine_config.generation.higher_resolution:
-        logger.info("higher_resolution is disabled, skipping stage-2 LoRA weights")
+        logger.debug("higher_resolution is disabled, skipping stage-2 LoRA weights")
         return None, None
     lora_files = sorted(Path(checkpoint_dir).glob("*lora*.safetensors"))
     if not lora_files:
         raise ValueError("higher_resolution is enabled but no LoRA weight file exists at the checkpoint root.")
     if len(lora_files) > 1:
         raise ValueError(f"higher_resolution needs one stage-2 LoRA file but found several: {lora_files}")
-    logger.info(f"Loading stage-2 LoRA file {lora_files[0]}")
+    logger.debug(f"Loading stage-2 LoRA file {lora_files[0]}")
     return parse_lora_state_dict(load_file(str(lora_files[0]), device="cpu"))
 
 

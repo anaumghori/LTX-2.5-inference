@@ -2,9 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.model.common import DiagonalGaussian
-
-
 class AudioCausalConv2d(nn.Module):
     """2D convolution that never looks beyond the current position along one axis.
     Padding is computed by hand so the causal axis only repeats past values,
@@ -157,34 +154,6 @@ class AudioResnetBlock(nn.Module):
         return x + h
 
 
-class AudioDownsample(nn.Module):
-    """Halve audio resolution with a causal convolution or plain averaging."""
-    def __init__(self, in_channels, with_conv, causality_axis="height"):
-        super().__init__()
-        self.with_conv = with_conv
-        self.causality_axis = causality_axis
-        if self.with_conv:
-            self.conv = torch.nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
-
-    def forward(self, x):
-        if self.with_conv:
-            if self.causality_axis == "none":
-                pad = (0, 1, 0, 1)
-            elif self.causality_axis == "width":
-                pad = (2, 0, 0, 1)
-            elif self.causality_axis == "height":
-                pad = (0, 1, 2, 0)
-            elif self.causality_axis == "width-compatibility":
-                pad = (1, 0, 0, 1)
-            else:
-                raise ValueError(f"Invalid causality_axis {self.causality_axis}")
-            x = F.pad(x, pad, mode="constant", value=0)
-            x = self.conv(x)
-        else:
-            x = F.avg_pool2d(x, kernel_size=2, stride=2)
-        return x
-
-
 class AudioUpsample(nn.Module):
     """Double audio resolution, then trim the extra border row the convolution adds.
     The trim keeps the output causally aligned instead of leaking one step ahead.
@@ -213,109 +182,6 @@ class AudioUpsample(nn.Module):
         if self.causality_axis in (None, "none", "width-compatibility"):
             return x
         raise ValueError(f"Invalid causality_axis: {self.causality_axis}")
-
-
-class AudioEncoder(nn.Module):
-    """Compress audio spectrograms into latent features through downsampling."""
-    def __init__(
-        self, base_channels, output_channels, num_res_blocks, attn_resolutions, in_channels,
-        resolution, latent_channels, ch_mult, norm_type, causality_axis,
-        dropout, mid_block_add_attention, sample_rate, mel_hop_length, is_causal,
-        mel_bins, double_z,
-    ):
-        super().__init__()
-        self.sample_rate = sample_rate
-        self.mel_hop_length = mel_hop_length
-        self.is_causal = is_causal
-        self.mel_bins = mel_bins
-        self.base_channels = base_channels
-        self.temb_ch = 0
-        self.num_resolutions = len(ch_mult)
-        self.num_res_blocks = num_res_blocks
-        self.resolution = resolution
-        self.in_channels = in_channels
-        self.out_ch = output_channels
-        self.norm_type = norm_type
-        self.latent_channels = latent_channels
-        self.channel_multipliers = ch_mult
-        self.attn_resolutions = attn_resolutions
-        self.causality_axis = causality_axis
-        base_block_channels = base_channels
-        base_resolution = resolution
-        if self.causality_axis is not None:
-            self.conv_in = AudioCausalConv2d(
-                in_channels, base_block_channels, kernel_size=3, stride=1, causality_axis=self.causality_axis
-            )
-        else:
-            self.conv_in = nn.Conv2d(in_channels, base_block_channels, kernel_size=3, stride=1, padding=1)
-        self.down = nn.ModuleList()
-        block_in = base_block_channels
-        curr_res = self.resolution
-        for level in range(self.num_resolutions):
-            stage = nn.Module()
-            stage.block = nn.ModuleList()
-            stage.attn = nn.ModuleList()
-            block_out = self.base_channels * self.channel_multipliers[level]
-            for _ in range(self.num_res_blocks):
-                stage.block.append(
-                    AudioResnetBlock(
-                        in_channels=block_in, out_channels=block_out, temb_channels=self.temb_ch, dropout=dropout,
-                        norm_type=self.norm_type, causality_axis=self.causality_axis,
-                    )
-                )
-                block_in = block_out
-                if self.attn_resolutions:
-                    if curr_res in self.attn_resolutions:
-                        stage.attn.append(AudioAttnBlock(block_in, norm_type=self.norm_type))
-            if level != self.num_resolutions - 1:
-                stage.downsample = AudioDownsample(block_in, True, causality_axis=self.causality_axis)
-                curr_res = curr_res // 2
-            self.down.append(stage)
-        self.mid = nn.Module()
-        self.mid.block_1 = AudioResnetBlock(
-            in_channels=block_in, out_channels=block_in, temb_channels=self.temb_ch, dropout=dropout,
-            norm_type=self.norm_type, causality_axis=self.causality_axis,
-        )
-        if mid_block_add_attention:
-            self.mid.attn_1 = AudioAttnBlock(block_in, norm_type=self.norm_type)
-        else:
-            self.mid.attn_1 = nn.Identity()
-        self.mid.block_2 = AudioResnetBlock(
-            in_channels=block_in, out_channels=block_in, temb_channels=self.temb_ch, dropout=dropout,
-            norm_type=self.norm_type, causality_axis=self.causality_axis,
-        )
-        final_block_channels = block_in
-        z_channels = 2 * latent_channels if double_z else latent_channels
-        if self.norm_type == "group":
-            self.norm_out = nn.GroupNorm(num_groups=32, num_channels=final_block_channels, eps=1e-6, affine=True)
-        elif self.norm_type == "pixel":
-            self.norm_out = AudioPixelNorm(dim=1, eps=1e-6)
-        else:
-            raise ValueError(f"Invalid normalization type: {self.norm_type}")
-        self.non_linearity = nn.SiLU()
-        if self.causality_axis is not None:
-            self.conv_out = AudioCausalConv2d(
-                final_block_channels, z_channels, kernel_size=3, stride=1, causality_axis=self.causality_axis
-            )
-        else:
-            self.conv_out = nn.Conv2d(final_block_channels, z_channels, kernel_size=3, stride=1, padding=1)
-
-    def forward(self, hidden_states):
-        hidden_states = self.conv_in(hidden_states)
-        for level in range(self.num_resolutions):
-            stage = self.down[level]
-            for block_idx, block in enumerate(stage.block):
-                hidden_states = block(hidden_states, temb=None)
-                if stage.attn:
-                    hidden_states = stage.attn[block_idx](hidden_states)
-            if level != self.num_resolutions - 1 and hasattr(stage, "downsample"):
-                hidden_states = stage.downsample(hidden_states)
-        hidden_states = self.mid.block_1(hidden_states, temb=None)
-        hidden_states = self.mid.attn_1(hidden_states)
-        hidden_states = self.mid.block_2(hidden_states, temb=None)
-        hidden_states = self.norm_out(hidden_states)
-        hidden_states = self.non_linearity(hidden_states)
-        return self.conv_out(hidden_states)
 
 
 class AudioDecoder(nn.Module):
@@ -440,34 +306,14 @@ class AudioDecoder(nn.Module):
 
 
 class AudioVAE(nn.Module):
-    """Compress audio spectrograms into latents and rebuild them.
-    The encoder is optional because inference only decodes, and leaving it out
-    avoids loading its weights.
+    """Rebuild audio spectrograms from latents.
+
+    The engine generates audio latents with the transformer, so only the decoder side is
+    built and the encoder's weights are never loaded.
     """
-    def __init__(self, config, with_encoder=True):
+    def __init__(self, config):
         super().__init__()
         self.config = config
-        self.encoder = None
-        if with_encoder:
-            self.encoder = AudioEncoder(
-                base_channels=config.base_channels,
-                output_channels=config.output_channels,
-                num_res_blocks=config.num_res_blocks,
-                attn_resolutions=config.attn_resolutions,
-                in_channels=config.in_channels,
-                resolution=config.resolution,
-                latent_channels=config.latent_channels,
-                ch_mult=config.ch_mult,
-                norm_type=config.norm_type,
-                causality_axis=config.causality_axis,
-                dropout=config.dropout,
-                mid_block_add_attention=config.mid_block_add_attention,
-                sample_rate=config.sample_rate,
-                mel_hop_length=config.mel_hop_length,
-                is_causal=config.is_causal,
-                mel_bins=config.mel_bins,
-                double_z=config.double_z,
-            )
         self.decoder = AudioDecoder(
             base_channels=config.base_channels,
             output_channels=config.output_channels,
@@ -494,13 +340,6 @@ class AudioVAE(nn.Module):
         self.mel_compression_ratio = config.mel_compression_ratio
         self.sample_rate = config.sample_rate
         self.mel_hop_length = config.mel_hop_length
-
-    def encode(self, x):
-        if self.encoder is None:
-            raise ValueError("AudioVAE was built without an encoder, audio input encoding is not available.")
-        h = self.encoder(x)
-        posterior = DiagonalGaussian(h)
-        return posterior.sample()
 
     def decode(self, z):
         return self.decoder(z)

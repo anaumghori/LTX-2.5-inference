@@ -3,17 +3,6 @@ import math
 import torch
 import torch.nn as nn
 
-def resolve_device(device=None):
-    """Return a concrete torch device, pinning CUDA to an explicit ordinal"""
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(device)
-    if device.type == "cuda" and device.index is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    return device
-
-
 @contextlib.contextmanager
 def default_float_dtype(dtype):
     previous = torch.get_default_dtype()
@@ -186,7 +175,7 @@ def nearest_valid_frame_count(frame_count, temporal_compression_ratio, min_frame
     return max(first_grid_frame, min(nearest, last_grid_frame))
 
 
-def resolve_num_frames(seconds, frame_rate=24.0, temporal_compression_ratio=8, min_seconds=1.0, max_seconds=20.0):
+def resolve_num_frames(seconds, frame_rate, temporal_compression_ratio, min_seconds, max_seconds):
     """Resolve a duration to the nearest valid frame count.
     Durations outside the supported range are clamped rather than rejected.
     NaN is the exception, since it cannot be clamped.

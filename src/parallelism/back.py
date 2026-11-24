@@ -9,10 +9,9 @@ import torch.nn.functional as F
 from src.cache.residual_cache import ResidualCache
 from src.model.attention_backend import stage_backends
 from src.model.common import DiagonalGaussian
-from src.model.logging_utils import get_logger
+from src.logging_utils import get_logger
 from src.model.lora import lora_strength
 from src.model.pipeline import (
-    STAGE_2_SIGMA_FALLBACK,
     denormalize_audio_latents,
     denormalize_video_latents,
     normalize_video_latents,
@@ -35,6 +34,7 @@ from src.parallelism.partition import (
     stg_pass_after_decision,
     uses_text_guidance,
 )
+from src.profiling import end_step
 
 logger = get_logger(__name__)
 
@@ -176,12 +176,13 @@ class BackHalf(Half):
                     total_blocks=self.split.block_count,
                     replay_start=self.split.split_index,
                     replay_end=self.split.cache_end,
+                    settings=self.engine_config.cache,
                     decision_pass=None,
                 )
         else:
             lane.stage_settings = stage2_settings(lane.settings)
             lane.scheduler, lane.audio_scheduler, lane.timesteps = stage_two_schedulers(
-                self.model_config.scheduler, self.device
+                self.model_config.scheduler, self.engine_config.stage2_sigmas, self.device
             )
             lane.cache = None
             lane.video_grid = lane.video_grid.refined()
@@ -407,6 +408,7 @@ class BackHalf(Half):
         lane.queue = []
         lane.predictions = {}
         lane.captured = {}
+        end_step(lane.index)
         return lane.latents, lane.audio_latents
 
     def refine_noise(self, lane):
@@ -501,7 +503,7 @@ class BackHalf(Half):
             ref_tokens = pack_video_latents(clean[:, :, :1], patch_size, patch_size_t).squeeze(0)
             ref_mask = torch.zeros((1, refined.tokens), device=self.device, dtype=torch.float32)
             ref_mask[:, : refined.tokens_per_frame] = lane.settings.image_strength
-        noise_scale = STAGE_2_SIGMA_FALLBACK[0]
+        noise_scale = self.engine_config.stage2_sigmas[0]
         latents = renoise_packed_latents(latents, noise_scale, video_noise)
         if ref_mask is not None and ref_tokens is not None:
             # Renoising would erase the pinned frame, so the pin is applied after it.
@@ -516,7 +518,7 @@ class BackHalf(Half):
         lane.ref_tokens = ref_tokens
         self.start_stage(lane, 1)
         self.begin_step(lane)
-        logger.info(
+        logger.debug(
             f"Request {lane.request_id} refinement stage prepared: {refined.tokens} video tokens at "
             f"{refined.latent_height}x{refined.latent_width}, {len(lane.timesteps)} steps"
         )

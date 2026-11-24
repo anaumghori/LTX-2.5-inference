@@ -4,7 +4,7 @@ import torch
 
 from src.cache.residual_cache import ResidualCache
 from src.model.attention_backend import stage_backends
-from src.model.logging_utils import get_logger
+from src.logging_utils import get_logger
 from src.model.lora import lora_strength
 from src.model.pipeline import (
     pack_audio_latents,
@@ -19,6 +19,7 @@ from src.parallelism.partition import (
     stg_pass_after_decision,
     uses_text_guidance,
 )
+from src.profiling import end_step
 
 logger = get_logger(__name__)
 
@@ -91,10 +92,6 @@ class FrontHalf(Half):
         return prompt_embeds, attention_mask
 
     def _predict_duration(self, video_tokens, audio_tokens, text_guidance):
-        if self.duration_head is None:
-            raise ValueError(
-                "Automatic duration requires a duration_head; load the duration head or provide duration_seconds."
-            )
         video_tokens = select_positive_branch(video_tokens, text_guidance)
         audio_tokens = select_positive_branch(audio_tokens, text_guidance)
         return self.duration_head(video_tokens[:1], audio_tokens[:1]).item()
@@ -174,6 +171,7 @@ class FrontHalf(Half):
                 total_blocks=self.split.block_count,
                 replay_start=self.split.cache_start,
                 replay_end=self.split.split_index,
+                settings=self.engine_config.cache,
                 decision_pass="cfg",
             )
         lane = FrontLane(
@@ -306,6 +304,7 @@ class FrontHalf(Half):
     def adopt_step_latents(self, lane, video, audio):
         """Take a step's latents from the second GPU, or report that the stage just ended."""
         self._adopt_latents(lane, video, audio, "step")
+        end_step(lane.index)
         lane.step_index += 1
         if lane.step_index >= len(lane.timesteps):
             if lane.cache is not None:
@@ -337,7 +336,9 @@ class FrontHalf(Half):
         lane.passes = self._stage_passes(stage_settings, None)
         lane.queue = []
         lane.step_reuse = False
-        lane.timesteps = stage_two_timesteps(self.model_config.scheduler, self.device)
+        lane.timesteps = stage_two_timesteps(
+            self.model_config.scheduler, self.engine_config.stage2_sigmas, self.device
+        )
         lane.step_index = 0
         lane.cache = None
         lane.conditioning_sent = set()

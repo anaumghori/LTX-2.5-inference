@@ -2,12 +2,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-LEADING_BLOCKS = 8
-TAIL_BLOCKS = 8
-DRIFT_BUDGET = 0.30
-WARMUP_STEPS = 10
-MAX_CONSECUTIVE_REUSED_STEPS = 1
-
 
 def cache_for_pass(cache, pass_name):
     """Return the cache switched to one transformer pass or None for a stage that runs without one."""
@@ -37,41 +31,18 @@ class ResidualCache:
     One pass per step makes the decision and the other passes follow it, so a step is
     computed or reused as a whole."""
 
-    def __init__(
-        self,
-        total_blocks,
-        replay_start,
-        replay_end,
-        decision_pass=None,
-        *,
-        drift_budget=None,
-        per_step_tolerance=None,
-        max_consecutive_reused_steps=None,
-        warmup_steps=None,
-    ):
+    def __init__(self, total_blocks, replay_start, replay_end, settings, decision_pass=None):
         if not 0 <= replay_start <= replay_end <= total_blocks:
             raise ValueError(
                 f"The cache region [{replay_start}, {replay_end}) does not fit inside {total_blocks} blocks."
             )
-        if per_step_tolerance is not None and per_step_tolerance < 0:
-            raise ValueError("The per-step tolerance cannot be negative.")
-        if max_consecutive_reused_steps is not None and max_consecutive_reused_steps < 0:
-            raise ValueError("The consecutive-reuse cap cannot be negative.")
-        if warmup_steps is not None and warmup_steps < 0:
-            raise ValueError("The warm-up step count cannot be negative.")
-        self.total_blocks = total_blocks
         self.replay_start = replay_start
         self.replay_end = replay_end
         self.decision_pass = decision_pass
         self.decides = decision_pass is not None
-        self.drift_budget = DRIFT_BUDGET if drift_budget is None else float(drift_budget)
-        self.per_step_tolerance = per_step_tolerance
-        self.max_consecutive_reused_steps = (
-            MAX_CONSECUTIVE_REUSED_STEPS
-            if max_consecutive_reused_steps is None
-            else int(max_consecutive_reused_steps)
-        )
-        self.warmup_steps = WARMUP_STEPS if warmup_steps is None else int(warmup_steps)
+        self.drift_budget = settings.drift_budget
+        self.max_consecutive_reused_steps = settings.max_consecutive_reused_steps
+        self.warmup_steps = settings.warmup_steps
         self._passes = {}
         self._pass_name = None
         self._step_index = -1
@@ -124,20 +95,13 @@ class ResidualCache:
             self._check_shapes(positive_video, state.leading_video, pass_name)
             self._check_shapes(positive_audio, state.leading_audio, pass_name)
             difference = self._relative_difference(positive_video, state.leading_video)
-            # `per_step_tolerance` replaces the cumulative budget with a per-step limit;
-            # when it is unset the production cumulative budget is used unchanged.
-            within_limit = (
-                difference <= self.per_step_tolerance
-                if self.per_step_tolerance is not None
-                else self._drift_spent + difference <= self.drift_budget
-            )
-            reuse = self._step_eligible and within_limit
+            within_budget = self._drift_spent + difference <= self.drift_budget
+            reuse = self._step_eligible and within_budget
             if reuse:
                 self._drift_spent += difference
             logger.debug(
                 f"Cache step {self._step_index}: leading residual difference {difference:.5f}, "
-                f"drift {self._drift_spent:.5f}, "
-                f"limit {self.per_step_tolerance if self.per_step_tolerance is not None else self.drift_budget:.5f}, "
+                f"drift {self._drift_spent:.5f} of {self.drift_budget:.5f}, "
                 f"eligible {self._step_eligible}, reuse={reuse} for blocks "
                 f"{self.replay_start} to {self.replay_end - 1}"
             )
@@ -160,8 +124,7 @@ class ResidualCache:
         self._reused_passes += 1
         logger.debug(
             f"Cache step {self._step_index}: pass {pass_name!r} replays its half of the residual computed at "
-            f"step {state.residual_step_index}, {self._step_index - state.residual_step_index} step(s) old, "
-            f"{tuple(state.residual_video.shape)} video and {tuple(state.residual_audio.shape)} audio"
+            f"step {state.residual_step_index}, {self._step_index - state.residual_step_index} step(s) old"
         )
         return state.residual_video, state.residual_audio
 
@@ -173,10 +136,6 @@ class ResidualCache:
         state.residual_audio = residual_audio.detach()
         state.residual_step_index = step_index
         self._computed_passes += 1
-        logger.debug(
-            f"Cache step {self._step_index}: pass {pass_name!r} stored its half of the residual, "
-            f"{tuple(residual_video.shape)} video, {tuple(residual_audio.shape)} audio, epoch {step_index}"
-        )
 
     def residual_step(self, pass_name):
         """The step this pass's stored residual was recorded at or -1 when it holds none."""
@@ -185,46 +144,11 @@ class ResidualCache:
             return -1
         return state.residual_step_index
 
-    def stats(self):
-        """A read-only snapshot of what this half's cache holds right now."""
-        return {
-            "decides": self.decides,
-            "decision_pass": self.decision_pass,
-            "region": [self.replay_start, self.replay_end],
-            "step_index": self._step_index,
-            "step_eligible": self._step_eligible,
-            "step_reuse": self._step_reuse,
-            "consecutive_reused_steps": self._consecutive_reused_steps,
-            "computed_passes": self._computed_passes,
-            "reused_passes": self._reused_passes,
-            "drift_spent": round(self._drift_spent, 6),
-            "drift_budget": self.drift_budget,
-            "per_step_tolerance": self.per_step_tolerance,
-            "max_consecutive_reused_steps": self.max_consecutive_reused_steps,
-            "warmup_steps": self.warmup_steps,
-            "passes": {
-                name: {
-                    "residual_video_shape": (
-                        list(state.residual_video.shape) if state.residual_video is not None else None
-                    ),
-                    "residual_audio_shape": (
-                        list(state.residual_audio.shape) if state.residual_audio is not None else None
-                    ),
-                    "residual_step": state.residual_step_index,
-                    "leading_video_shape": (
-                        list(state.leading_video.shape) if state.leading_video is not None else None
-                    ),
-                }
-                for name, state in self._passes.items()
-            },
-        }
-
     def reset(self, reason):
         """Drop every cached residual and log what the finished phase did."""
         logger.debug(
             f"Cache reset ({reason}): {self._computed_passes} computed passes, "
-            f"{self._reused_passes} reused passes, drift {self._drift_spent:.5f}, "
-            f"limit {self.per_step_tolerance if self.per_step_tolerance is not None else self.drift_budget:.5f}"
+            f"{self._reused_passes} reused passes, drift {self._drift_spent:.5f} of {self.drift_budget:.5f}"
         )
         self._passes.clear()
         self._pass_name = None

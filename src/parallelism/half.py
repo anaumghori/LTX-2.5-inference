@@ -3,9 +3,10 @@ from typing import Optional
 import torch
 
 from src.cache.residual_cache import ResidualCache, cache_for_pass
-from src.model.config import GenerationSettings
+from src.config import GenerationSettings
 from src.model.pipeline import LatentGeometry
 from src.parallelism.partition import step_passes
+from src.profiling import begin_step
 
 
 @dataclasses.dataclass
@@ -78,9 +79,6 @@ class Half:
     def _backend_stage(self, lane):
         return "stage1" if lane.stage == 0 else "stage2"
 
-    def _stg_blocks(self, lane):
-        return lane.stage_settings.stg_blocks or [28]
-
     def _rotary(self, video_grid, audio_grid):
         """Build the rotary tables a token grid needs; they depend on position only, so once per stage is enough."""
         video_coords = self.transformer.rope.prepare_video_coords(
@@ -116,10 +114,11 @@ class Half:
         )
 
     def _open_step(self, lane):
-        """Start a step: tell the cache which step this is and clear the reuse decision."""
+        """Start a step: tell the cache which step this is, clear the reuse decision, mark the step."""
         if lane.cache is not None:
             lane.cache.begin_step(lane.step_index)
         lane.step_reuse = False
+        begin_step(lane.index, lane.request_id, lane.stage, lane.step_index)
 
     def _pop_plan(self, lane, plan):
         """Remove the pass the queue is waiting for, refusing any other pass."""
@@ -160,6 +159,6 @@ class Half:
             reuse=reuse,
             capture_block=capture_block,
             captured_states=captured_states,
-            perturb_blocks=self._stg_blocks(lane) if plan.name == "stg" else (),
+            perturb_blocks=lane.stage_settings.stg_blocks if plan.name == "stg" else (),
             isolate_modalities=plan.isolates_modalities,
         )

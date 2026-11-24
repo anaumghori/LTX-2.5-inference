@@ -6,7 +6,7 @@ from typing import Optional
 
 @dataclass(frozen=True)
 class GenerationRequest:
-    """One caller-supplied generation request"""
+    """A generation request as a caller supplies it."""
     prompt: str
     duration_seconds: Optional[float] = None
     refine: bool = False
@@ -14,12 +14,8 @@ class GenerationRequest:
 
 
 class RequestStatus(str, Enum):
-    """Where a request currently sits in the engine's lifecycle"""
+    """Where a request sits in the engine's lifecycle."""
     ADMITTED = "admitted"
-    PREPARING = "preparing"
-    RUNNING = "running"
-    TRANSITIONING = "transitioning"
-    DECODING = "decoding"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
     FAILED = "failed"
@@ -27,7 +23,7 @@ class RequestStatus(str, Enum):
 
 @dataclass(frozen=True)
 class GenerationResult:
-    """The files one completed request produced, named by its request identifier."""
+    """The files one completed request produced."""
     request_id: int
     request: GenerationRequest
     video_path: Path

@@ -1,14 +1,11 @@
 import dataclasses
 from typing import Optional
 
-from src.cache.residual_cache import LEADING_BLOCKS, TAIL_BLOCKS
-
 # Passes travel as short codes, so the receiving GPU can name the pass it was told to run
 # without sending the name as text.
 PASS_CFG = 1
 PASS_STG = 2
 PASS_MODALITY = 3
-PASS_NAMES = {PASS_CFG: "cfg", PASS_STG: "stg", PASS_MODALITY: "modality"}
 
 
 def uses_text_guidance(settings):
@@ -63,25 +60,26 @@ class PipelineSplit:
         )
 
 
-def plan_split(block_count, settings):
-    has_stg = settings.stg_scale != 0.0 or settings.audio_stg_scale != 0.0
-    stg_start = min(settings.stg_blocks or [28]) if has_stg else block_count
-    full_stack_samples = 3
+def plan_split(block_count, settings, cache_settings):
+    has_stg, has_modality = has_guidance_passes(settings)
+    stg_start = min(settings.stg_blocks) if has_stg else block_count
+    full_stack_passes = (2 if uses_text_guidance(settings) else 1) + (1 if has_modality else 0)
     mid_stack_blocks = block_count - stg_start if has_stg else 0
-    split = round((block_count * full_stack_samples + mid_stack_blocks) / (2 * full_stack_samples))
-    lower_bound = LEADING_BLOCKS + 1
-    upper_bound = min(block_count - TAIL_BLOCKS, stg_start)
+    split = round((block_count * full_stack_passes + mid_stack_blocks) / (2 * full_stack_passes))
+    lower_bound = cache_settings.leading_blocks + 1
+    upper_bound = min(block_count - cache_settings.tail_blocks, stg_start)
     if lower_bound > upper_bound:
         raise ValueError(
-            f"The cache keeps blocks {LEADING_BLOCKS} through {block_count - TAIL_BLOCKS - 1} and the mid-stack "
-            f"pass starts at {stg_start}, so there is no block to split after."
+            f"The cache keeps blocks {cache_settings.leading_blocks} through "
+            f"{block_count - cache_settings.tail_blocks - 1} and the mid-stack pass starts at {stg_start}, "
+            "so there is no block to split after."
         )
     split = min(max(split, lower_bound), upper_bound)
     return PipelineSplit(
         block_count=block_count,
         front_blocks=split,
-        cache_start=LEADING_BLOCKS,
-        cache_end=block_count - TAIL_BLOCKS,
+        cache_start=cache_settings.leading_blocks,
+        cache_end=block_count - cache_settings.tail_blocks,
         stg_start=stg_start,
         has_stg=has_stg,
     )

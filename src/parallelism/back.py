@@ -177,6 +177,7 @@ class BackHalf(Half):
                     replay_start=self.split.split_index,
                     replay_end=self.split.cache_end,
                     settings=self.engine_config.cache,
+                    lane_index=lane.lane,
                     decision_pass=None,
                 )
         else:
@@ -408,7 +409,7 @@ class BackHalf(Half):
         lane.queue = []
         lane.predictions = {}
         lane.captured = {}
-        end_step(lane.index)
+        end_step(lane.lane)
         return lane.latents, lane.audio_latents
 
     def refine_noise(self, lane):

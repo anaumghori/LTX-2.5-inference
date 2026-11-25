@@ -172,6 +172,7 @@ class FrontHalf(Half):
                 replay_start=self.split.cache_start,
                 replay_end=self.split.split_index,
                 settings=self.engine_config.cache,
+                lane_index=lane_index,
                 decision_pass="cfg",
             )
         lane = FrontLane(
@@ -304,7 +305,7 @@ class FrontHalf(Half):
     def adopt_step_latents(self, lane, video, audio):
         """Take a step's latents from the second GPU, or report that the stage just ended."""
         self._adopt_latents(lane, video, audio, "step")
-        end_step(lane.index)
+        end_step(lane.lane)
         lane.step_index += 1
         if lane.step_index >= len(lane.timesteps):
             if lane.cache is not None:

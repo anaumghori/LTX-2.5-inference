@@ -1,5 +1,7 @@
 import logging
 
+from src.profiling import mark
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,11 +33,12 @@ class ResidualCache:
     One pass per step makes the decision and the other passes follow it, so a step is
     computed or reused as a whole."""
 
-    def __init__(self, total_blocks, replay_start, replay_end, settings, decision_pass=None):
+    def __init__(self, total_blocks, replay_start, replay_end, settings, lane_index, decision_pass=None):
         if not 0 <= replay_start <= replay_end <= total_blocks:
             raise ValueError(
                 f"The cache region [{replay_start}, {replay_end}) does not fit inside {total_blocks} blocks."
             )
+        self.lane_index = lane_index
         self.replay_start = replay_start
         self.replay_end = replay_end
         self.decision_pass = decision_pass
@@ -84,6 +87,7 @@ class ResidualCache:
         state = self._passes.setdefault(pass_name, _PassState())
         positive_video = leading_video[-1:]
         positive_audio = leading_audio[-1:]
+        difference = 0.0
         if pass_name != self.decision_pass:
             reuse = self._step_reuse
             logger.debug(f"Cache step {self._step_index}: pass {pass_name!r} follows the decision, reuse={reuse}")
@@ -111,6 +115,13 @@ class ResidualCache:
                 self._consecutive_reused_steps += 1
             else:
                 self._consecutive_reused_steps = 0
+            age = self._step_index - state.residual_step_index if state.residual_video is not None else -1
+            mark(
+                f"cache lane={self.lane_index} step={self._step_index} reuse={int(reuse)} "
+                f"eligible={int(self._step_eligible)} "
+                f"difference={difference:.5f} spent={self._drift_spent:.5f} "
+                f"budget={self.drift_budget:.5f} age={age}"
+            )
         state.leading_video = positive_video.detach().clone()
         state.leading_audio = positive_audio.detach().clone()
         return reuse

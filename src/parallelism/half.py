@@ -118,7 +118,7 @@ class Half:
         if lane.cache is not None:
             lane.cache.begin_step(lane.step_index)
         lane.step_reuse = False
-        begin_step(lane.index, lane.request_id, lane.stage, lane.step_index)
+        begin_step(lane.lane, lane.request_id, lane.stage, lane.step_index)
 
     def _pop_plan(self, lane, plan):
         """Remove the pass the queue is waiting for, refusing any other pass."""

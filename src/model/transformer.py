@@ -42,35 +42,6 @@ COMPILE_OPTIONS = {
 }
 
 
-_NORM_LIBRARY = torch.library.Library("ltx_engine", "FRAGMENT")
-_NORM_LIBRARY.define("native_rms_norm(Tensor x, Tensor? weight, float? eps) -> Tensor")
-
-
-def _native_rms_norm_impl(x, weight, eps):
-    return F.rms_norm(x, (x.shape[-1],), weight, eps)
-
-
-def _native_rms_norm_meta(x, weight, eps):
-    return torch.empty(x.shape, dtype=x.dtype, device=x.device)
-
-
-_NORM_LIBRARY.impl("native_rms_norm", _native_rms_norm_impl, "CompositeExplicitAutograd")
-_NORM_LIBRARY.impl("native_rms_norm", _native_rms_norm_meta, "Meta")
-
-
-def _native_rms_norm(x: torch.Tensor, weight: Optional[torch.Tensor], eps: Optional[float]) -> torch.Tensor:
-    return torch.ops.ltx_engine.native_rms_norm.default(x, weight, eps)
-
-
-def _pinned_rms_norm_forward(self, x):
-    if len(self.normalized_shape) != 1:
-        raise ValueError(f"Only one-dimensional norms are pinned, got {self.normalized_shape}.")
-    return _native_rms_norm(x, self.weight, self.eps)
-
-
-nn.RMSNorm.forward = _pinned_rms_norm_forward
-
-
 class PixArtAlphaTextProjection(nn.Module):
     """Project text embeddings into the transformer's working width."""
     def __init__(self, in_features, hidden_size, out_features=None):

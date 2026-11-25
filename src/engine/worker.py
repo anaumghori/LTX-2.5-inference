@@ -32,7 +32,7 @@ from src.logging_utils import get_logger
 from src.model.weights import load_model_configs
 from src.parallelism.partition import PipelineSplit
 from src.parallelism.weights import load_back_half, load_front_half
-from src.profiling import release_lane, span
+from src.profiling import release_lane, set_role, span
 
 logger = get_logger(__name__)
 
@@ -63,6 +63,7 @@ def worker_main(connection, config):
     """Entry point of a worker process"""
     try:
         worker = FrontWorker(connection, config) if config.role == "front" else BackWorker(connection, config)
+        set_role(config.role)
         worker.run()
     except BaseException as error:
         logger.exception(f"The {config.role} half failed")

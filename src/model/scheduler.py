@@ -89,6 +89,17 @@ class FlowMatchEulerScheduler:
         self._begin_index = None
         self.order = 1
 
+    @classmethod
+    def from_schedule(cls, config, sigmas, timesteps):
+        """Construct a scheduler instance directly from prebuilt schedule tensors on device."""
+        scheduler = cls(config)
+        scheduler.num_inference_steps = len(timesteps)
+        scheduler.timesteps = timesteps
+        scheduler.sigmas = sigmas
+        scheduler._step_index = None
+        scheduler._begin_index = 0
+        return scheduler
+
     def time_shift(self, mu, exponent, sigmas):
         """Remap sigmas so sampling spends more steps at the noise levels `mu` selects.
 
@@ -155,11 +166,14 @@ class FlowMatchEulerScheduler:
             sigmas = self.stretch_shift_to_terminal(sigmas)
         if self.config.use_karras_sigmas or self.config.use_exponential_sigmas or self.config.use_beta_sigmas:
             raise ValueError("Karras, exponential, and beta sigma schedules are not supported.")
-        sigmas = torch.from_numpy(sigmas).to(dtype=torch.float32, device=device)
+        sigmas_np = np.append(sigmas.astype(np.float32, copy=False), np.float32(0.0))
+        if device is not None and torch.device(device).type == "cuda":
+            sigmas = torch.from_numpy(sigmas_np).pin_memory().to(dtype=torch.float32, device=device, non_blocking=True)
+        else:
+            sigmas = torch.from_numpy(sigmas_np).to(dtype=torch.float32, device=device)
         # Timesteps are the training-scale version of the sigmas, while the extra trailing
         # zero gives every denoising step a current and next sigma pair, including the last one.
-        timesteps = sigmas * self.num_train_timesteps
-        sigmas = torch.cat([sigmas, torch.zeros(1, device=sigmas.device)])
+        timesteps = sigmas[:-1] * self.num_train_timesteps
         self.timesteps = timesteps
         self.sigmas = sigmas
         self._step_index = None

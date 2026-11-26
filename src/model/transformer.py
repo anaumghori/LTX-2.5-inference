@@ -192,18 +192,15 @@ class LTX2Attention(nn.Module):
         if self.to_gate_logits is not None:
             gate_logits = self.to_gate_logits(hidden_states)
         value = self.to_v(encoder_hidden_states)
-        if perturbation_mask is not None:
-            if all_perturbed is None:
-                all_perturbed = bool(torch.all(perturbation_mask == 0))
-            if all_perturbed:
-                # A fully perturbed pass skips attention and returns the values, which
-                # is what spatiotemporal guidance compares against the normal output.
-                hidden_states = value
-                if self.to_gate_logits is not None:
-                    hidden_states = hidden_states.unflatten(2, (self.heads, -1))
-                    gates = 2.0 * torch.sigmoid(gate_logits)
-                    hidden_states = (hidden_states * gates.unsqueeze(-1)).flatten(2, 3)
-                return self.to_out[0](hidden_states)  # to_out[1] is a zero-probability dropout
+        if all_perturbed is None and perturbation_mask is not None:
+            all_perturbed = bool(torch.all(perturbation_mask == 0))
+        if all_perturbed:
+            hidden_states = value
+            if self.to_gate_logits is not None:
+                hidden_states = hidden_states.unflatten(2, (self.heads, -1))
+                gates = 2.0 * torch.sigmoid(gate_logits)
+                hidden_states = (hidden_states * gates.unsqueeze(-1)).flatten(2, 3)
+            return self.to_out[0](hidden_states)  # to_out[1] is a zero-probability dropout
         query = self.to_q(hidden_states)
         key = self.to_k(encoder_hidden_states)
         query = self.norm_q(query)
@@ -642,6 +639,13 @@ class RotaryPosEmbed(nn.Module):
             raise ValueError(f"Modality {modality} is not supported.")
         self.modality = modality
         self.double_precision = double_precision
+        self.register_buffer(
+            "_patch_size_delta",
+            torch.tensor((patch_size_t, patch_size, patch_size), dtype=torch.int64).view(3, 1, 1, 1),
+            persistent=False,
+        )
+        scale_dtype = torch.int64 if all(isinstance(v, int) for v in scale_factors) else torch.float32
+        self.register_buffer("_scale_tensor", torch.tensor(scale_factors, dtype=scale_dtype), persistent=False)
 
     def prepare_video_coords(self, batch_size, num_frames, height, width, device, fps=24.0):
         """Build start/end coordinate boxes for every packed video token"""
@@ -650,13 +654,11 @@ class RotaryPosEmbed(nn.Module):
         grid_w = torch.arange(start=0, end=width, step=self.patch_size, dtype=torch.float32, device=device)
         grid = torch.meshgrid(grid_f, grid_h, grid_w, indexing="ij")
         grid = torch.stack(grid, dim=0)
-        patch_size = (self.patch_size_t, self.patch_size, self.patch_size)
-        patch_size_delta = torch.tensor(patch_size, dtype=grid.dtype, device=grid.device)
-        patch_ends = grid + patch_size_delta.view(3, 1, 1, 1)
+        patch_ends = grid + self._patch_size_delta.to(device=grid.device, dtype=grid.dtype)
         latent_coords = torch.stack([grid, patch_ends], dim=-1)
         latent_coords = latent_coords.flatten(1, 3)
         latent_coords = latent_coords.unsqueeze(0).repeat(batch_size, 1, 1, 1)
-        scale_tensor = torch.tensor(self.scale_factors, device=latent_coords.device)
+        scale_tensor = self._scale_tensor.to(device=latent_coords.device, dtype=latent_coords.dtype)
         broadcast_shape = [1] * latent_coords.ndim
         broadcast_shape[1] = -1
         pixel_coords = latent_coords * scale_tensor.view(*broadcast_shape)
@@ -799,7 +801,7 @@ class PassConditioning:
     def positive_branch(self):
         """The conditioning of the positive sample, which the guidance passes run alone"""
         def last(tensor):
-            return None if tensor is None else tensor[-1:]
+            return None if tensor is None else tensor[-1:].contiguous()
 
         return PassConditioning(
             temb=last(self.temb),
@@ -997,13 +999,31 @@ class VideoTransformer(nn.Module):
         self.set_compile(compile_blocks)
 
     def set_compile(self, enabled):
-        """Run the blocks this side owns as compiled graphs, or leave them eager"""
-        self.compiled_blocks = [
-            torch.compile(self.transformer_blocks[index], fullgraph=False, options=COMPILE_OPTIONS)
-            if enabled and index in self.block_range
-            else self.transformer_blocks[index]
-            for index in range(self.config.num_layers)
-        ]
+        """Run the blocks this side owns as per-stage compiled graphs, or leave them eager"""
+        def wrap(index):
+            if enabled and index in self.block_range:
+                return torch.compile(self.transformer_blocks[index], fullgraph=False, options=COMPILE_OPTIONS)
+            return self.transformer_blocks[index]
+
+        self.compiled_stage1_blocks = [wrap(index) for index in range(self.config.num_layers)]
+        self.compiled_stage2_blocks = [wrap(index) for index in range(self.config.num_layers)]
+        self.compiled_blocks = self.compiled_stage1_blocks
+
+    @torch.no_grad()
+    def project_prompts(self, encoder_hidden_states, audio_encoder_hidden_states):
+        """Project connector text embeddings into transformer width once per stage."""
+        if not self.with_input:
+            raise RuntimeError("This half does not hold the transformer's input machinery.")
+        if not self.config.use_prompt_embeddings:
+            return encoder_hidden_states, audio_encoder_hidden_states
+        batch_size = encoder_hidden_states.size(0)
+        hidden_dim = self.config.num_attention_heads * self.config.attention_head_dim
+        audio_dim = self.config.audio_num_attention_heads * self.config.audio_attention_head_dim
+        encoder_hidden_states = self.caption_projection(encoder_hidden_states).view(batch_size, -1, hidden_dim)
+        audio_encoder_hidden_states = self.audio_caption_projection(audio_encoder_hidden_states).view(
+            batch_size, -1, audio_dim
+        )
+        return encoder_hidden_states, audio_encoder_hidden_states
 
     def prepare_rotary_embeddings(self, video_coords, audio_coords, video_device, audio_device):
         """Build the video, audio and cross-modal rotary tables for one position set.
@@ -1031,6 +1051,7 @@ class VideoTransformer(nn.Module):
         audio_encoder_attention_mask=None,
         video_keyframes_mask=None,
         use_cross_timestep=True,
+        prompts_projected=False,
     ):
         """Project this pass's latents and derive every value its blocks need"""
         if not self.with_input:
@@ -1092,7 +1113,7 @@ class VideoTransformer(nn.Module):
         )
         audio_cross_attn_scale_shift = audio_cross_attn_scale_shift.view(batch_size, -1, audio_cross_attn_scale_shift.shape[-1])
         audio_cross_attn_v2a_gate = audio_cross_attn_v2a_gate.view(batch_size, -1, audio_cross_attn_v2a_gate.shape[-1])
-        if config.use_prompt_embeddings:
+        if config.use_prompt_embeddings and not prompts_projected:
             encoder_hidden_states = self.caption_projection(encoder_hidden_states)
             encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.size(-1))
             audio_encoder_hidden_states = self.audio_caption_projection(audio_encoder_hidden_states)
@@ -1126,6 +1147,7 @@ class VideoTransformer(nn.Module):
         rotary_emb,
         pass_name,
         step_index,
+        stage=0,
         cache=None,
         reuse=None,
         capture_block=None,
@@ -1153,33 +1175,31 @@ class VideoTransformer(nn.Module):
         audio_encoder_hidden_states = conditioning.audio_encoder_hidden_states
         encoder_attention_mask = conditioning.encoder_attention_mask
         audio_encoder_attention_mask = conditioning.audio_encoder_attention_mask
-        batch_size = hidden_states.size(0)
         stg_blocks = set(perturb_blocks)
         if len(stg_blocks) > 0 and perturbation_mask is None:
-            # Requesting guidance blocks without an explicit mask means perturbing
-            # every batch entry, so start from an all-perturbed default mask.
-            perturbation_mask = torch.zeros((batch_size,))
-        if perturbation_mask is not None and perturbation_mask.ndim == 1:
-            perturbation_mask = perturbation_mask[:, None, None]
-        all_perturbed = all_perturbed or (
-            bool(torch.all(perturbation_mask == 0)) if perturbation_mask is not None else False
-        )
+            all_perturbed = True
+        if perturbation_mask is not None:
+            if perturbation_mask.ndim == 1:
+                perturbation_mask = perturbation_mask[:, None, None]
+            all_perturbed = all_perturbed or bool(torch.all(perturbation_mask == 0))
+        blocks = self.compiled_stage1_blocks if stage == 0 else self.compiled_stage2_blocks
         region_start = cache.replay_start if cache is not None else None
         region_end = cache.replay_end if cache is not None else None
         owns_region_start = cache is not None and lo <= region_start < hi
-        stack_input = (hidden_states, audio_hidden_states)
+        stack_video_input = hidden_states
         region_start_states = None
         region_end_states = None
         for block_idx in range(lo, hi):
-            block = self.compiled_blocks[block_idx]
+            block = blocks[block_idx]
             if owns_region_start and block_idx == region_start:
                 region_start_states = (hidden_states, audio_hidden_states)
                 if reuse is None:
-                    reuse = cache.decide(
-                        pass_name,
-                        hidden_states - stack_input[0],
-                        audio_hidden_states - stack_input[1],
+                    leading_video = (
+                        hidden_states[-1:] - stack_video_input[-1:]
+                        if cache.needs_probe(pass_name)
+                        else None
                     )
+                    reuse = cache.decide(pass_name, leading_video)
                 if reuse:
                     cached_video, cached_audio = cache.replay(pass_name)
                     hidden_states = hidden_states + cached_video
@@ -1228,7 +1248,7 @@ class VideoTransformer(nn.Module):
                 perturbation_mask=block_perturbation_mask,
                 all_perturbed=block_all_perturbed,
             )
-        if cache is not None and not reuse:
+        if cache is not None and not reuse and cache.should_record():
             if region_start_states is None:
                 raise RuntimeError(f"Pass {pass_name!r} never crossed the cache boundary at block {region_start}.")
             if region_end_states is None:

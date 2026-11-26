@@ -8,6 +8,8 @@ from src.model.scheduler import FlowMatchEulerScheduler, calculate_shift, retrie
 
 def select_positive_branch(tensor, text_guidance):
     """Picks the positive half of a [negative, positive] prompt batch"""
+    if tensor is None:
+        return None
     return tensor.chunk(2, dim=0)[1] if text_guidance else tensor
 
 
@@ -234,23 +236,12 @@ def _stage_two_config(scheduler_config):
     return stage2_config
 
 
-def stage_two_schedulers(scheduler_config, sigmas, device):
-    """Build the refinement stage's sampler instances and its distilled few-step schedule."""
+def stage_two_schedule(scheduler_config, sigmas, device):
+    """Precompute the refinement stage's config, sigmas, and timesteps once on device."""
     stage2_config = _stage_two_config(scheduler_config)
-    video = FlowMatchEulerScheduler(stage2_config)
-    audio = FlowMatchEulerScheduler(stage2_config)
-    timesteps, _ = retrieve_timesteps(video, len(sigmas), device, sigmas=sigmas)
-    retrieve_timesteps(audio, len(sigmas), device, sigmas=sigmas)
-    video.set_begin_index(0)
-    audio.set_begin_index(0)
-    return video, audio, timesteps
-
-
-def stage_two_timesteps(scheduler_config, sigmas, device):
-    """The refinement stage's timesteps, for the first GPU, which builds the model input."""
-    scheduler = FlowMatchEulerScheduler(_stage_two_config(scheduler_config))
+    scheduler = FlowMatchEulerScheduler(stage2_config)
     timesteps, _ = retrieve_timesteps(scheduler, len(sigmas), device, sigmas=sigmas)
-    return timesteps
+    return stage2_config, scheduler.sigmas, timesteps
 
 
 def renoise_packed_latents(latents, noise_scale, noise):

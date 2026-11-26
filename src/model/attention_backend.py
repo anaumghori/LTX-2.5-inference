@@ -1,5 +1,4 @@
 import contextlib
-import contextvars
 import importlib
 import json
 import platform
@@ -24,19 +23,22 @@ SDPA = "sdpa"
 CUDNN = "cudnn"
 SAGE = "sage"
 SAGE_MODULE = "sageattention"
-SAGE_KERNEL = "sageattn_qk_int8_pv_fp16_cuda"
+SAGE_KERNEL = "sageattn_qk_int8_pv_fp8_cuda"
 # Settings passed to the kernel on every call. "HND" means the tensors are laid out as
 # heads-first, which is the layout the model already uses, so no reshuffling is needed.
-SAGE_KERNEL_OPTIONS = {"tensor_layout": "HND", "pv_accum_dtype": "fp32"}
+SAGE_KERNEL_OPTIONS = {
+    "tensor_layout": "HND",
+    "qk_quant_gran": "per_warp",
+    "pv_accum_dtype": "fp32+fp16",
+}
 # The GPU capability this wheel is compiled for, written as (major, minor).
 SAGE_COMPUTE_CAPABILITY = (12, 0)
 # How far the kernel's output may drift from PyTorch's own attention and still be accepted.
 # SageAttention trades a little precision for speed on purpose, so the two outputs are never
 # bit-for-bit identical. The error is the average absolute difference divided by the average
-# size of the reference output. The pinned INT8/FP16 kernel lands around 0.007, while the FP8
-# variant lands around 0.02, so this limit accepts the kernel we chose and rejects a build
-# whose kernel is noticeably less accurate.
-SAGE_ACCEPTANCE_RELATIVE_ERROR = 0.02
+# size of the reference output. The pinned INT8/FP8 kernel lands around 0.036-0.039 relative error,
+# so this limit accepts the kernel we chose and rejects a build whose kernel is noticeably less accurate.
+SAGE_ACCEPTANCE_RELATIVE_ERROR = 0.05
 # The tensor shape used for the GPU check: (batch, heads, tokens, head size).
 SAGE_VERIFICATION_SHAPE = (1, 2, 1024, 128)
 # The video-to-text cuDNN path is checked at its engine width: 32 heads of 128 against 1024
@@ -52,7 +54,8 @@ PREPARE_COMMAND = "uv run python -m scripts.prepare_attention"
 WHEEL_DIR = Path(__file__).resolve().parents[2] / "vendor" / "wheels"
 MANIFEST_NAME = "manifest.json"
 
-_stage = contextvars.ContextVar("attention_backend_stage", default="stage1")
+_stage = "stage1"
+_cached_sage_kernel = None
 
 def environment_identity():
     return {
@@ -73,19 +76,21 @@ def read_manifest():
 @contextlib.contextmanager
 def stage_backends(stage):
     """Run the enclosed denoising stage with the backends that stage is configured for."""
+    global _stage
     if stage not in ("stage1", "stage2"):
         raise ValueError(f"Expected 'stage1' or 'stage2', got {stage!r}")
-    token = _stage.set(stage)
+    previous = _stage
+    _stage = stage
     try:
         yield
     finally:
-        _stage.reset(token)
+        _stage = previous
 
 
 def resolve_backend(role):
     """The backend a role runs on, given the stage the denoising loop is in."""
     if role == VIDEO_SELF:
-        return SAGE if _stage.get() == "stage2" else SDPA
+        return SAGE if _stage == "stage2" else SDPA
     if role == VIDEO_TEXT:
         return CUDNN
     return SDPA
@@ -121,8 +126,22 @@ def _cudnn_attention_meta(query, key, value, attn_mask):
     return torch.empty_like(query)
 
 
+@torch.library.custom_op("ltx_engine::sage_attention", mutates_args=())
+def sage_attention_op(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    return sage_kernel()(query, key, value, **SAGE_KERNEL_OPTIONS).contiguous()
+
+
+@sage_attention_op.register_fake
+def _sage_attention_meta(query, key, value):
+    return torch.empty(query.shape, dtype=query.dtype, device=query.device)
+
+
 def sage_attention(query, key, value, attn_mask=None):
-    """Run the INT8-query/FP16-value SageAttention kernel on head-first tensors"""
+    """Run the INT8-query/FP8-value SageAttention kernel on head-first tensors"""
     if attn_mask is not None:
         raise ValueError(
             f"{SAGE_KERNEL} ignores attn_mask, so it cannot run a masked attention call; "
@@ -130,11 +149,14 @@ def sage_attention(query, key, value, attn_mask=None):
         )
     if query.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"{SAGE_KERNEL} needs bf16 or fp16 input, got {query.dtype}")
-    return sage_kernel()(query, key, value, **SAGE_KERNEL_OPTIONS)
+    return sage_attention_op(query, key, value)
 
 
 def sage_kernel():
     """The installed kernel, refusing a package that does not export it"""
+    global _cached_sage_kernel
+    if _cached_sage_kernel is not None:
+        return _cached_sage_kernel
     try:
         module = importlib.import_module(SAGE_MODULE)
     except ImportError as exc:
@@ -148,6 +170,7 @@ def sage_kernel():
             f"{SAGE_MODULE} {getattr(module, '__version__', 'unknown')} does not export "
             f"{SAGE_KERNEL}; rebuild it with `{PREPARE_COMMAND} --force`."
         )
+    _cached_sage_kernel = kernel
     return kernel
 
 
@@ -172,12 +195,19 @@ def verify_attention_backends(device):
         )
 
     manifest = _verified_manifest()
-    kernel = sage_kernel()
+    sage_kernel()
     module = importlib.import_module(SAGE_MODULE)
-    query = torch.randn(SAGE_VERIFICATION_SHAPE, device=device, dtype=torch.bfloat16)
-    key = torch.randn(SAGE_VERIFICATION_SHAPE, device=device, dtype=torch.bfloat16)
-    value = torch.randn(SAGE_VERIFICATION_SHAPE, device=device, dtype=torch.bfloat16)
-    output = kernel(query, key, value, **SAGE_KERNEL_OPTIONS)
+    batch, heads, tokens, head_dim = SAGE_VERIFICATION_SHAPE
+    query = torch.randn(
+        (batch, tokens, heads * head_dim), device=device, dtype=torch.bfloat16
+    ).unflatten(2, (heads, head_dim)).transpose(1, 2)
+    key = torch.randn(
+        (batch, tokens, heads * head_dim), device=device, dtype=torch.bfloat16
+    ).unflatten(2, (heads, head_dim)).transpose(1, 2)
+    value = torch.randn(
+        (batch, tokens, heads * head_dim), device=device, dtype=torch.bfloat16
+    ).unflatten(2, (heads, head_dim)).transpose(1, 2)
+    output = sage_attention_op(query, key, value)
     reference = F.scaled_dot_product_attention(query, key, value)
     if not torch.isfinite(output).all():
         raise RuntimeError(f"{SAGE_KERNEL} produced non-finite output on {device}")
@@ -185,6 +215,11 @@ def verify_attention_backends(device):
         raise RuntimeError(
             f"{SAGE_KERNEL} returned {tuple(output.shape)}, expected "
             f"{SAGE_VERIFICATION_SHAPE}"
+        )
+    if not output.is_contiguous():
+        raise RuntimeError(
+            f"{SAGE_KERNEL} returned non-contiguous output strides {tuple(output.stride())}; "
+            "its fake kernel requires contiguous output."
         )
     difference = (output.float() - reference.float()).abs()
     relative_error = float(
@@ -226,33 +261,36 @@ def _verify_masked_attention(device):
     mask = torch.zeros((1, 1, 1, CUDNN_VERIFICATION_KEYS), device=device, dtype=torch.bfloat16).expand(
         batch, heads, tokens, CUDNN_VERIFICATION_KEYS
     )
-    output = cudnn_attention(query, key, value, mask)
-    reference = F.scaled_dot_product_attention(
-        query, key, value, attn_mask=mask, dropout_p=0.0, is_causal=False
-    )
-    if not torch.isfinite(output).all():
-        raise RuntimeError(f"cuDNN attention produced non-finite output on {device}")
-    if tuple(output.shape) != CUDNN_VERIFICATION_SHAPE:
-        raise RuntimeError(
-            f"cuDNN attention returned {tuple(output.shape)}, expected {CUDNN_VERIFICATION_SHAPE}"
+    max_error = 0.0
+    for attn_mask in (mask, None):
+        output = cudnn_attention(query, key, value, attn_mask)
+        reference = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
         )
-    if output.stride() != query.stride():
-        raise RuntimeError(
-            f"cuDNN attention returned strides {tuple(output.stride())} for a query strided "
-            f"{tuple(query.stride())}; the fake kernel in this module must declare the layout "
-            "the kernel actually writes, or a compiled block stops on its layout assertion."
+        if not torch.isfinite(output).all():
+            raise RuntimeError(f"cuDNN attention produced non-finite output on {device}")
+        if tuple(output.shape) != CUDNN_VERIFICATION_SHAPE:
+            raise RuntimeError(
+                f"cuDNN attention returned {tuple(output.shape)}, expected {CUDNN_VERIFICATION_SHAPE}"
+            )
+        if output.stride() != query.stride():
+            raise RuntimeError(
+                f"cuDNN attention returned strides {tuple(output.stride())} for a query strided "
+                f"{tuple(query.stride())}; the fake kernel in this module must declare the layout "
+                "the kernel actually writes, or a compiled block stops on its layout assertion."
+            )
+        relative_error = float(
+            (output.float() - reference.float()).abs().mean()
+            / reference.float().abs().mean().clamp_min(1e-8)
         )
-    relative_error = float(
-        (output.float() - reference.float()).abs().mean()
-        / reference.float().abs().mean().clamp_min(1e-8)
-    )
-    if relative_error > CUDNN_ACCEPTANCE_RELATIVE_ERROR:
-        raise RuntimeError(
-            f"cuDNN attention differs from PyTorch's attention by {relative_error:.4f} "
-            f"relative, above the {CUDNN_ACCEPTANCE_RELATIVE_ERROR} acceptance bound; the "
-            "pinned video-to-text kernel is not the one the engine was validated against."
-        )
-    return relative_error
+        if relative_error > CUDNN_ACCEPTANCE_RELATIVE_ERROR:
+            raise RuntimeError(
+                f"cuDNN attention differs from PyTorch's attention by {relative_error:.4f} "
+                f"relative, above the {CUDNN_ACCEPTANCE_RELATIVE_ERROR} acceptance bound; the "
+                "pinned video-to-text kernel is not the one the engine was validated against."
+            )
+        max_error = max(max_error, relative_error)
+    return max_error
 
 
 def _verified_manifest():

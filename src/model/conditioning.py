@@ -236,7 +236,7 @@ class ConnectorTransformer1d(nn.Module):
             hidden_states = torch.where(front_mask, front_aligned, registers_expanded.to(hidden_states.dtype))
             # Every slot now holds either a real token or a register, so the mask
             # is cleared and the blocks attend to the full compressed sequence.
-            attention_mask = torch.zeros_like(attention_mask)
+            attention_mask = None
         rotary_emb = self.rope(batch_size, seq_len, device=hidden_states.device)
         for block in self.transformer_blocks:
             hidden_states = block(hidden_states, attention_mask=attention_mask, rotary_emb=rotary_emb)
@@ -324,11 +324,15 @@ class TextConnectors(nn.Module):
         attention_mask = attention_mask.reshape(attention_mask.shape[0], 1, -1, attention_mask.shape[-1])
         add_attn_mask = attention_mask * torch.finfo(text_dtype).max
         video_text_embedding, video_attn_mask = self.video_connector(video_text_emb_proj, add_attn_mask)
-        binary_attn_mask = (video_attn_mask < 1e-6).to(torch.int64)
-        binary_attn_mask = binary_attn_mask.reshape(video_text_embedding.shape[0], video_text_embedding.shape[1], 1)
-        video_text_embedding = video_text_embedding * binary_attn_mask
+        if video_attn_mask is not None:
+            binary_attn_mask = (video_attn_mask < 1e-6).to(torch.int64)
+            binary_attn_mask = binary_attn_mask.reshape(video_text_embedding.shape[0], video_text_embedding.shape[1], 1)
+            video_text_embedding = video_text_embedding * binary_attn_mask
+            binary_attn_mask = binary_attn_mask.squeeze(-1)
+        else:
+            binary_attn_mask = None
         audio_text_embedding, _ = self.audio_connector(audio_text_emb_proj, add_attn_mask)
-        return video_text_embedding, audio_text_embedding, binary_attn_mask.squeeze(-1)
+        return video_text_embedding, audio_text_embedding, binary_attn_mask
 
 
 class DurationAttentionPooler(nn.Module):

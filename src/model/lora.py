@@ -1,6 +1,6 @@
 import contextlib
-import contextvars
 import math
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -28,22 +28,22 @@ CHECKPOINT_TO_LOCAL_PREFIXES = [
     ("patchify_proj", "proj_in"),
 ]
 
-# The strength every adapter currently computes with. It is set by the stage that is
-# running and read when a wrapped layer produces its update, so the module tree never
-# changes during a request and no stage can leave its strength behind for the next one.
-_strength = contextvars.ContextVar("lora_strength", default=1.0)
-
+# The strength every adapter currently computes with. Defaulting to 0.0 ensures an
+# adapter never fires outside an explicit stage scope.
+_strength = 0.0
 
 @contextlib.contextmanager
 def lora_strength(value):
+    global _strength
     value = float(value)
     if not math.isfinite(value) or value < 0:
         raise ValueError(f"LoRA strength must be finite and non-negative, got {value}.")
-    token = _strength.set(value)
+    previous = _strength
+    _strength = value
     try:
         yield
     finally:
-        _strength.reset(token)
+        _strength = previous
 
 
 def map_lora_target(key):
@@ -140,13 +140,25 @@ class LoRAAugmentedLinear(nn.Module):
         self.lora_A = nn.Parameter(lora_a.detach().clone().to(device=device, dtype=dtype))
         self.lora_B = nn.Parameter(lora_b.detach().clone().to(device=device, dtype=dtype))
         self.lora_scale = scale
+        self._fuse_row_threshold = (base.in_features * base.out_features) // (
+            base.in_features + base.out_features
+        )
 
     def forward(self, x):
-        out = self.base(x)
-        # A zero strength removes the adapter from the arithmetic completely
-        strength = _strength.get()
+        strength = _strength
         if strength == 0.0:
-            return out
+            return self.base(x)
+        if isinstance(self.base, nn.Linear):
+            rows = x.numel() // self.base.in_features
+            if rows > self._fuse_row_threshold:
+                weight = torch.addmm(
+                    self.base.weight,
+                    self.lora_B,
+                    self.lora_A,
+                    alpha=strength * self.lora_scale,
+                )
+                return F.linear(x, weight, self.base.bias)
+        out = self.base(x)
         # Run the low-rank path in its stored precision for stability, then convert back
         # so the adjustment matches the base output before the two are combined.
         lora_out = F.linear(F.linear(x.to(self.lora_A.dtype), self.lora_A), self.lora_B)

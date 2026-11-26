@@ -3,6 +3,9 @@ import torch.nn as nn
 
 from src.model.common import PixArtAlphaCombinedTimestepSizeEmbeddings
 
+TEMPORAL_TILE_LATENT_FRAMES = 37
+TEMPORAL_OVERLAP_LATENT_FRAMES = 2
+
 
 class PerChannelRMSNorm(nn.Module):
     """Normalize each channel to unit root-mean-square, preserving sign."""
@@ -683,4 +686,56 @@ class VideoVAE(nn.Module):
 
     def decode(self, z, temb=None, generator=None):
         """Decode latents into video frames, optionally modulated by a timestep embedding."""
-        return self.decoder(z, temb, generator=generator)
+        if not self.decoder.is_causal or z.shape[2] <= TEMPORAL_TILE_LATENT_FRAMES:
+            return self.decoder(z, temb, generator=generator)
+        return self._decode_tiled(z, temb=temb, generator=generator)
+
+    def _decode_tiled(self, z, temb=None, generator=None):
+        """Decode long clips in overlapping causal temporal chunks to bound peak activation memory."""
+        batch_size, _, num_latent_frames, latent_h, latent_w = z.shape
+        scale = self.temporal_compression_ratio
+        spatial_scale = self.spatial_compression_ratio
+        num_output_frames = 1 + (num_latent_frames - 1) * scale
+        stride = TEMPORAL_TILE_LATENT_FRAMES - TEMPORAL_OVERLAP_LATENT_FRAMES
+        starts = list(range(0, num_latent_frames - TEMPORAL_OVERLAP_LATENT_FRAMES, stride))
+        if not starts:
+            starts = [0]
+        ends = [min(start + TEMPORAL_TILE_LATENT_FRAMES, num_latent_frames) for start in starts]
+        if ends[-1] < num_latent_frames:
+            starts.append(max(0, num_latent_frames - TEMPORAL_TILE_LATENT_FRAMES))
+            ends.append(num_latent_frames)
+        output = torch.zeros(
+            (batch_size, self.config.out_channels, num_output_frames, latent_h * spatial_scale, latent_w * spatial_scale),
+            device=z.device,
+            dtype=z.dtype,
+        )
+        weights = torch.zeros((1, 1, num_output_frames, 1, 1), device=z.device, dtype=torch.float32)
+        for index, (start, end) in enumerate(zip(starts, ends)):
+            causal_start = start - 1 if index > 0 else 0
+            tile = self.decoder(
+                z[:, :, causal_start:end].contiguous(),
+                temb,
+                generator=generator,
+            )
+            out_start = causal_start * scale
+            out_end = 1 + (end - 1) * scale
+            tile_len = out_end - out_start
+            if tile.shape[2] != tile_len:
+                raise RuntimeError(
+                    f"Tiled VAE decode produced {tile.shape[2]} frames for slice [{causal_start}, {end}), "
+                    f"expected {tile_len}."
+                )
+            mask = torch.ones(tile_len, device=z.device, dtype=torch.float32)
+            if index > 0:
+                left = 1 + (ends[index - 1] - start) * scale
+                mask[:left] *= torch.linspace(0.0, 1.0, left + 1, device=z.device, dtype=torch.float32)[:-1]
+            if index < len(starts) - 1:
+                right = 1 + (end - starts[index + 1]) * scale
+                mask[-right:] *= torch.linspace(1.0, 0.0, right + 1, device=z.device, dtype=torch.float32)[:-1]
+            mask_view = mask.view(1, 1, -1, 1, 1)
+            tile.mul_(mask_view.to(tile.dtype))
+            output[:, :, out_start:out_end].add_(tile)
+            weights[:, :, out_start:out_end].add_(mask_view)
+            del tile
+        output.div_(weights.to(output.dtype).clamp_min(1e-8))
+        return output

@@ -1,10 +1,12 @@
+import collections
 from concurrent.futures import Future, InvalidStateError
 import copy
 from dataclasses import dataclass, replace
 import dataclasses
 import multiprocessing
+import multiprocessing.connection
+import os
 from pathlib import Path
-import queue
 import socket
 import threading
 import time
@@ -13,6 +15,7 @@ import torch
 
 from src.config import EngineConfig, GenerationSettings
 from src.device_memory import BYTES_PER_GB
+from src.engine.protocol import WakeSignal
 from src.engine.request import GenerationRequest, GenerationResult, RequestStatus
 from src.engine.worker import WorkerConfig, worker_main
 from src.logging_utils import get_logger
@@ -23,8 +26,8 @@ from src.parallelism.partition import plan_split
 logger = get_logger(__name__)
 
 ROLES = ("front", "back") # The two worker roles, one per GPU.
-# How long a terminated worker is given to die before the engine stops waiting for it
 TERMINATE_JOIN_SECONDS = 10.0
+KILL_JOIN_SECONDS = 5.0
 
 
 @dataclass
@@ -86,8 +89,10 @@ class Engine:
         logger.info(f"Pipeline split: {self.split.describe()}")
         self._check_devices()
         self._lanes = [_Lane(index) for index in range(self.lane_count)]
-        self._submissions = queue.Queue(maxsize=self.engine_config.queue_capacity)
-        self._submission_lock = threading.Lock()
+        self._decoding = {}
+        self._submissions = collections.deque()
+        self._submission_cond = threading.Condition()
+        self._wake = WakeSignal()
         self._next_request_id = 1
         self._output_namespace = uuid.uuid4().hex
         self._completed = 0
@@ -104,6 +109,7 @@ class Engine:
             # here is what keeps a failed start from leaving a device occupied until the other
             # half happens to notice its pipe is gone.
             self._stop_workers(self.engine_config.failure_shutdown_grace_seconds)
+            self._wake.close()
             raise
         self._control = threading.Thread(target=self._control_loop, name="engine-control", daemon=True)
         self._control.start()
@@ -178,14 +184,19 @@ class Engine:
             )
 
     def _start_workers(self):
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        worker_threads = str(max(1, (os.cpu_count() or 4) // 4))
+        os.environ.setdefault("OMP_NUM_THREADS", worker_threads)
+        os.environ.setdefault("MKL_NUM_THREADS", worker_threads)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
         rendezvous = f"tcp://127.0.0.1:{port}"
         context = multiprocessing.get_context("spawn")
-        for role, rank, device_index in (
-            ("front", 0, self.engine_config.front_device),
-            ("back", 1, self.engine_config.back_device),
+        front_peer, back_peer = context.Pipe()
+        for role, rank, device_index, peer_connection in (
+            ("front", 0, self.engine_config.front_device, front_peer),
+            ("back", 1, self.engine_config.back_device, back_peer),
         ):
             parent_connection, child_connection = context.Pipe()
             config = WorkerConfig(
@@ -200,12 +211,13 @@ class Engine:
             )
             process = context.Process(
                 target=worker_main,
-                args=(child_connection, config),
+                args=(child_connection, peer_connection, config),
                 name=f"ltx-{role}",
                 daemon=True,
             )
             process.start()
             child_connection.close()
+            peer_connection.close()
             self._connections[role] = parent_connection
             self._processes[role] = process
             logger.info(f"Started the {role} worker as pid {process.pid} on device {device_index}")
@@ -235,29 +247,32 @@ class Engine:
 
     def _receive(self, role, timeout):
         connection = self._connections[role]
+        process = self._processes[role]
         deadline = time.monotonic() + timeout
         while True:
-            if connection.poll(0.05):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"The {role} worker did not report ready within {timeout:.0f}s; "
+                    "loading the checkpoint is the slowest step of startup."
+                )
+            multiprocessing.connection.wait([connection, process.sentinel], timeout=min(0.5, remaining))
+            if connection.poll():
                 try:
                     return connection.recv()
                 except EOFError as error:
                     # The half died without reporting, which is what a fault inside a kernel
                     # looks like: the exit code and its last log line are all there is.
-                    process = self._processes[role]
                     process.join(timeout=2.0)
                     raise RuntimeError(
                         f"The {role} worker exited with code {process.exitcode} before it "
                         "reported ready; see its traceback in the process log."
                     ) from error
-            if not self._processes[role].is_alive():
+            if not process.is_alive():
+                process.join(timeout=2.0)
                 raise RuntimeError(
-                    f"The {role} worker exited while the engine was waiting for it; "
-                    "see its traceback in the process log."
-                )
-            if time.monotonic() > deadline:
-                raise RuntimeError(
-                    f"The {role} worker did not report ready within {timeout:.0f}s; "
-                    "loading the checkpoint is the slowest step of startup."
+                    f"The {role} worker exited with code {process.exitcode} while the engine was "
+                    "waiting for it; see its traceback in the process log."
                 )
 
     def submit(self, request):
@@ -265,17 +280,15 @@ class Engine:
         if not isinstance(request, GenerationRequest):
             raise TypeError(f"request must be a GenerationRequest, got {type(request).__name__}.")
         future = Future()
-        while True:
-            with self._submission_lock:
-                if self._closed.is_set():
-                    raise RuntimeError("The engine is closed and cannot accept requests.")
-                try:
-                    self._submissions.put_nowait((request, future))
-                except queue.Full:
-                    pass
-                else:
-                    return future
-            time.sleep(0.1)
+        with self._submission_cond:
+            while len(self._submissions) >= self.engine_config.queue_capacity and not self._closed.is_set():
+                self._submission_cond.wait()
+            if self._closed.is_set():
+                raise RuntimeError("The engine is closed and cannot accept requests.")
+            self._submissions.append((request, future))
+        future.add_done_callback(lambda _: self._wake.set())
+        self._wake.set()
+        return future
 
     def generate(self, requests):
         """Run one request, or several, and wait only for those results."""
@@ -295,11 +308,14 @@ class Engine:
 
     def close(self):
         """Let the requests already running finish, then stop both workers."""
-        with self._submission_lock:
+        with self._submission_cond:
             first_close = not self._closed.is_set()
             self._closed.set()
+            self._submission_cond.notify_all()
+        self._wake.set()
         self._control.join()
         self._abandon_waiting()
+        self._wake.close()
         if first_close:
             logger.info(f"Engine closed after {self._completed} completed request(s)")
 
@@ -308,17 +324,29 @@ class Engine:
             self._run_control_loop()
         except Exception as error:
             logger.exception("Engine control loop failed; stopping both workers and failing outstanding requests")
-            self._closed.set()
+            with self._submission_cond:
+                self._closed.set()
+                self._submission_cond.notify_all()
             for lane in self._lanes:
                 if lane.record is not None:
                     lane.record.status = RequestStatus.FAILED
                     self._fail_future(lane.record.future, error)
                     self._release(lane)
+            for record in self._decoding.values():
+                record.status = RequestStatus.FAILED
+                self._fail_future(record.future, error)
+            self._decoding.clear()
             self._abandon_waiting(error)
             self._stop_workers(self.engine_config.failure_shutdown_grace_seconds)
 
     def _run_control_loop(self):
+        wait_handles = [
+            self._wake.read_fd,
+            *(self._connections[role] for role in ROLES),
+            *(self._processes[role].sentinel for role in ROLES),
+        ]
         while True:
+            self._wake.clear()
             self._poll_events()
             self._admit()
             for lane in self._lanes:
@@ -328,38 +356,58 @@ class Engine:
                     and not lane.cancel_requested
                 ):
                     self._request_cancel(lane)
-            active = any(lane.record is not None for lane in self._lanes)
+            active = any(not lane.free() for lane in self._lanes) or bool(self._decoding)
             if self._closed.is_set() and not active:
                 self._stop_workers(self.engine_config.shutdown_grace_seconds)
                 return
-            if not active:
-                time.sleep(0.01)
+            has_admittable = (
+                not self._closed.is_set()
+                and any(lane.free() for lane in self._lanes)
+                and bool(self._submissions)
+            )
+            if not has_admittable and not any(self._connections[role].poll() for role in ROLES):
+                multiprocessing.connection.wait(wait_handles, timeout=1.0)
 
     def _poll_events(self):
-        idle = True
         for role in ROLES:
             connection = self._connections[role]
             while connection.poll():
-                idle = False
                 try:
                     event = connection.recv()
                 except EOFError as error:
                     process = self._processes[role]
                     process.join(timeout=2.0)
-                    exit_code = process.exitcode
                     raise RuntimeError(
-                        f"The {role} worker exited with code {exit_code} without reporting "
+                        f"The {role} worker exited with code {process.exitcode} without reporting "
                         "what happened; see its traceback in the process log."
                     ) from error
                 self._handle_event(role, event)
-        if idle:
-            time.sleep(0.005)
+        for role in ROLES:
+            process = self._processes[role]
+            if not process.is_alive():
+                process.join(timeout=2.0)
+                raise RuntimeError(
+                    f"The {role} worker exited unexpectedly with code {process.exitcode}; "
+                    "see its traceback in the process log."
+                )
 
     def _handle_event(self, role, event):
         kind = event.get("kind")
         if kind == "crashed":
             raise RuntimeError(f"The {role} worker failed: {event.get('error')}")
+        if kind == "completed":
+            self._resolve_decoded(event)
+            return
+        if kind == "decode_failed":
+            self._fail_decoded(event)
+            return
         lane = self._lanes[event["lane"]]
+        if event.get("request_id") != lane.request_id:
+            logger.debug(
+                f"Ignoring stale {kind!r} event from {role} for request {event.get('request_id')} "
+                f"while lane {lane.index} holds request {lane.request_id}"
+            )
+            return
         if kind == "prepared":
             if role == "front":
                 # The second GPU cannot size its grids until it knows how long the clip is,
@@ -379,18 +427,26 @@ class Engine:
                     "lane": lane.index,
                 })
             return
-        if kind == "completed":
-            lane.result = event
+        if kind == "denoised":
+            record = lane.record
+            if record is not None:
+                self._decoding[record.request_id] = record
+                lane.record = None
             lane.back_released = True
-            self._finish_front(lane)
-            self._maybe_resolve(lane)
+            self._finish_front(lane, decoding=True)
+            if lane.front_released and lane.back_released:
+                self._release(lane)
             return
         if kind == "released":
             if role == "front":
                 lane.front_released = True
             else:
                 lane.back_released = True
-            self._maybe_resolve(lane)
+            if lane.record is None:
+                if lane.front_released and lane.back_released:
+                    self._release(lane)
+            else:
+                self._maybe_resolve(lane)
             return
         if kind == "failed":
             if lane.error is None:
@@ -406,52 +462,54 @@ class Engine:
     def _admit(self):
         if self._closed.is_set():
             return
-        lane = next((candidate for candidate in self._lanes if candidate.free()), None)
-        if lane is None:
-            return
-        try:
-            request, future = self._submissions.get_nowait()
-        except queue.Empty:
-            return
-        if future.cancelled():
-            return
-        request_id = self._next_request_id
-        self._next_request_id += 1
-        settings = replace(
-            copy.deepcopy(self.engine_config.generation),
-            prompt=request.prompt,
-            duration_seconds=request.duration_seconds,
-            higher_resolution=request.refine,
-            image_path=request.image_path,
-            output_name=f"result_{self._output_namespace}_{request_id}.mp4",
-        )
-        lane.record = _RequestRecord(
-            request_id=request_id,
-            request=request,
-            settings=settings,
-            future=future,
-            status=RequestStatus.ADMITTED,
-            started=time.monotonic(),
-        )
-        lane.request_id = request_id
-        lane.front_released = False
-        lane.back_released = False
-        lane.result = None
-        lane.error = None
-        lane.cancel_requested = False
-        message = {
-            "kind": "admit",
-            "request_id": request_id,
-            "lane": lane.index,
-            "settings": settings,
-        }
-        for role in ROLES:
-            self._send(role, message)
-        logger.debug(
-            f"Request {request_id} admitted into lane {lane.index}: {settings.duration_seconds}s, "
-            f"refine {settings.higher_resolution}, reference image {settings.image_path or 'none'}, "
-            f"{len(settings.prompt)} char prompt"
-        )
+        while True:
+            lane = next((candidate for candidate in self._lanes if candidate.free()), None)
+            if lane is None:
+                return
+            with self._submission_cond:
+                if not self._submissions:
+                    return
+                request, future = self._submissions.popleft()
+                self._submission_cond.notify()
+            if future.cancelled():
+                continue
+            request_id = self._next_request_id
+            self._next_request_id += 1
+            settings = replace(
+                copy.deepcopy(self.engine_config.generation),
+                prompt=request.prompt,
+                duration_seconds=request.duration_seconds,
+                higher_resolution=request.refine,
+                image_path=request.image_path,
+                output_name=f"result_{self._output_namespace}_{request_id}.mp4",
+            )
+            lane.record = _RequestRecord(
+                request_id=request_id,
+                request=request,
+                settings=settings,
+                future=future,
+                status=RequestStatus.ADMITTED,
+                started=time.monotonic(),
+            )
+            lane.request_id = request_id
+            lane.front_released = False
+            lane.back_released = False
+            lane.result = None
+            lane.error = None
+            lane.cancel_requested = False
+            message = {
+                "kind": "admit",
+                "request_id": request_id,
+                "lane": lane.index,
+                "settings": settings,
+            }
+            for role in ROLES:
+                self._send(role, message)
+            logger.debug(
+                f"Request {request_id} admitted into lane {lane.index}: {settings.duration_seconds}s, "
+                f"refine {settings.higher_resolution}, reference image {settings.image_path or 'none'}, "
+                f"{len(settings.prompt)} char prompt"
+            )
 
     def _request_cancel(self, lane):
         lane.cancel_requested = True
@@ -473,10 +531,60 @@ class Engine:
             "reason": "cancelled",
         })
 
-    def _finish_front(self, lane):
+    def _finish_front(self, lane, *, decoding=False):
         if lane.front_released:
             return
-        self._send("front", {"kind": "finish", "request_id": lane.request_id, "lane": lane.index})
+        self._send("front", {
+            "kind": "finish",
+            "request_id": lane.request_id,
+            "lane": lane.index,
+            "decoding": decoding,
+        })
+
+    def _resolve_decoded(self, event):
+        request_id = event["request_id"]
+        record = self._decoding.pop(request_id, None)
+        self._send("front", {"kind": "request_finished", "request_id": request_id})
+        if record is None:
+            return
+        self._publish_result(record, event)
+
+    def _fail_decoded(self, event):
+        request_id = event["request_id"]
+        record = self._decoding.pop(request_id, None)
+        self._send("front", {"kind": "request_finished", "request_id": request_id})
+        if record is None or record.future.cancelled():
+            return
+        record.status = RequestStatus.FAILED
+        self._fail_future(record.future, RuntimeError(event["error"]))
+
+    def _publish_result(self, record, event):
+        result = self._result(record, event)
+        if record.future.cancelled():
+            # The files were published before the caller gave up; the caller asked for
+            # no result, so nothing is left behind for it.
+            result.video_path.unlink(missing_ok=True)
+            result.audio_path.unlink(missing_ok=True)
+            record.status = RequestStatus.CANCELLED
+            logger.info(f"Request {record.request_id} cancelled as its result became available")
+            return
+        try:
+            record.future.set_result(result)
+        except InvalidStateError:
+            if not record.future.cancelled():
+                raise
+            result.video_path.unlink(missing_ok=True)
+            result.audio_path.unlink(missing_ok=True)
+            record.status = RequestStatus.CANCELLED
+            logger.info(f"Request {record.request_id} cancelled as its result became available")
+        else:
+            record.status = RequestStatus.COMPLETED
+            self._completed += 1
+            logger.info(
+                f"Request {record.request_id} finished in "
+                f"{time.monotonic() - record.started:.1f}s: {result.video_path.name} "
+                f"({result.frames} frames, {result.duration_seconds:.2f}s)"
+            )
 
     def _maybe_resolve(self, lane):
         """Resolve a request once both workers have let its lane go."""
@@ -489,29 +597,7 @@ class Engine:
             record.status = RequestStatus.FAILED
             self._fail_future(record.future, lane.error)
         elif lane.result is not None:
-            result = self._result(record, lane.result)
-            if record.future.cancelled():
-                # The files were published before the caller gave up; the caller asked for
-                # no result, so nothing is left behind for it.
-                result.video_path.unlink(missing_ok=True)
-                result.audio_path.unlink(missing_ok=True)
-                record.status = RequestStatus.CANCELLED
-                logger.info(f"Request {record.request_id} cancelled as its result became available")
-            else:
-                try:
-                    record.future.set_result(result)
-                except InvalidStateError:
-                    if not record.future.cancelled():
-                        raise
-                    record.status = RequestStatus.CANCELLED
-                else:
-                    record.status = RequestStatus.COMPLETED
-                    self._completed += 1
-                    logger.info(
-                        f"Request {record.request_id} finished in "
-                        f"{time.monotonic() - record.started:.1f}s: {result.video_path.name} "
-                        f"({result.frames} frames, {result.duration_seconds:.2f}s)"
-                    )
+            self._publish_result(record, lane.result)
         else:
             record.status = RequestStatus.CANCELLED
             if not record.future.done():
@@ -540,7 +626,7 @@ class Engine:
         lane.cancel_requested = False
 
     def _stop_workers(self, grace):
-        """Ask both workers to stop, and terminate any that outlive the grace period"""
+        """Ask both workers to stop, escalate to terminate then kill if they outlive grace."""
         for role in ROLES:
             try:
                 self._connections[role].send({"kind": "shutdown"})
@@ -552,17 +638,23 @@ class Engine:
                 logger.warning(f"The {role} worker did not stop within {grace:.0f}s; terminating it")
                 process.terminate()
                 process.join(timeout=TERMINATE_JOIN_SECONDS)
+            if process.is_alive():
+                logger.error(
+                    f"The {role} worker ignored SIGTERM for {TERMINATE_JOIN_SECONDS:.0f}s; killing it"
+                )
+                process.kill()
+                process.join(timeout=KILL_JOIN_SECONDS)
             self._connections[role].close()
 
     def _abandon_waiting(self, error=None):
         """Fail every submission that was never admitted into a lane."""
         if error is None:
             error = RuntimeError("The engine was closed before this request was admitted.")
-        while True:
-            try:
-                request, future = self._submissions.get_nowait()
-            except queue.Empty:
-                return
+        with self._submission_cond:
+            pending = list(self._submissions)
+            self._submissions.clear()
+            self._submission_cond.notify_all()
+        for _, future in pending:
             self._fail_future(future, error)
 
     @staticmethod

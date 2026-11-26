@@ -4,7 +4,8 @@ import torch
 
 from src.cache.residual_cache import ResidualCache, cache_for_pass
 from src.config import GenerationSettings
-from src.model.pipeline import LatentGeometry
+from src.model.pipeline import LatentGeometry, stage_two_schedule
+from src.model.scheduler import FlowMatchEulerScheduler
 from src.parallelism.partition import step_passes
 from src.profiling import begin_step
 
@@ -52,6 +53,20 @@ class Half:
         self.lora_installed = lora_installed
         self.geometry = LatentGeometry.from_configs(model_config, engine_config)
         self.frame_rate = engine_config.frame_rate
+        self._stage2_scheduler_config, self._stage2_sigmas, self._stage2_timesteps = (
+            stage_two_schedule(model_config.scheduler, engine_config.stage2_sigmas, device)
+        )
+
+    def stage_two_schedulers(self):
+        return (
+            FlowMatchEulerScheduler.from_schedule(
+                self._stage2_scheduler_config, self._stage2_sigmas, self._stage2_timesteps
+            ),
+            FlowMatchEulerScheduler.from_schedule(
+                self._stage2_scheduler_config, self._stage2_sigmas, self._stage2_timesteps
+            ),
+            self._stage2_timesteps,
+        )
 
     def _check_crop_size(self, settings):
         if settings.height % 32 != 0 or settings.width % 32 != 0:
@@ -155,6 +170,7 @@ class Half:
             rotary_emb=lane.rotary_emb,
             pass_name=plan.name,
             step_index=lane.step_index,
+            stage=lane.stage,
             cache=cache_for_pass(lane.cache, plan.name) if plan.cached else None,
             reuse=reuse,
             capture_block=capture_block,

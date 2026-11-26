@@ -1,7 +1,9 @@
+import collections
 import contextlib
 import dataclasses
 from datetime import timedelta
 import faulthandler
+import multiprocessing.connection
 import os
 from pathlib import Path
 import queue
@@ -20,10 +22,10 @@ from src.engine.protocol import (
     KIND_LATENTS,
     KIND_PASS,
     KIND_REF_TOKENS,
-    KIND_REFINE_NOISE,
     KIND_STATE,
-    Inbound,
     MessageHeader,
+    WakeSignal,
+    post_recv,
     post_send,
 )
 from src.model.attention_backend import verify_attention_backends
@@ -32,18 +34,21 @@ from src.logging_utils import get_logger
 from src.model.weights import load_model_configs
 from src.parallelism.partition import PipelineSplit
 from src.parallelism.weights import load_back_half, load_front_half
-from src.profiling import release_lane, set_role, span
+from src.profiling import finish_request, release_lane, set_role, span
 
 logger = get_logger(__name__)
 
 # How long a cancelled worker waits for the other worker's abort before releasing anyway
 CANCEL_GRACE_SECONDS = 2.0
-# How long the loop sleeps when no lane had anything to do.
-IDLE_SLEEP_SECONDS = 0.002
+# Fallback wait interval for deadline checks when control/peer/background pipes are quiet.
+IDLE_SLEEP_SECONDS = 0.05
+# Bounded wait for in-flight NCCL sends to complete during clean shutdown.
+CLEAN_SHUTDOWN_DRAIN_SECONDS = 2.0
 # How often the stall watchdog looks for movement, and the status a stalled worker exits with
 STALL_CHECK_SECONDS = 5.0
 STALL_EXIT_CODE = 4
 RETIRED_REQUESTS = 4
+PINNED_POOL_LIMIT = 2
 
 
 @dataclasses.dataclass
@@ -59,10 +64,15 @@ class WorkerConfig:
     split: PipelineSplit
 
 
-def worker_main(connection, config):
+def worker_main(connection, peer_connection, config):
     """Entry point of a worker process"""
+    torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", max(1, (os.cpu_count() or 4) // 4))))
     try:
-        worker = FrontWorker(connection, config) if config.role == "front" else BackWorker(connection, config)
+        worker = (
+            FrontWorker(connection, peer_connection, config)
+            if config.role == "front"
+            else BackWorker(connection, peer_connection, config)
+        )
         set_role(config.role)
         worker.run()
     except BaseException as error:
@@ -76,20 +86,29 @@ def worker_main(connection, config):
         raise
     finally:
         connection.close()
+        peer_connection.close()
 
 
 @dataclasses.dataclass
 class _DecodeJob:
-    """One lane's decode and file writing, running off the event loop."""
-    lane: int
+    """One finished request's latents queued for off-lane GPU decoding."""
     request: int
-    half: object
+    payload: object
     output_name: str
     started: float
-    done: threading.Event = dataclasses.field(default_factory=threading.Event)
-    seconds: float = 0.0
-    files: dict = dataclasses.field(default_factory=dict)
-    error: str = ""
+    ready_event: object = None
+
+
+@dataclasses.dataclass
+class _WriteJob:
+    """One decoded request's CPU arrays queued for muxing/writing off the decode stream."""
+    request: int
+    output_name: str
+    video_frames: object
+    audio_samples: object
+    started: float
+    video_buffer: object = None
+    audio_buffer: object = None
 
 
 class _Lane:
@@ -106,8 +125,9 @@ class _Lane:
         # When this lane started waiting for the other worker's next message, or 0 while it
         # is not waiting. This is what the message timeout is measured from.
         self.wait_since = 0.0
+        self.inbox = collections.deque()
         # Posted messages whose transfers may still be reading their buffers.
-        self.sends = []
+        self.sends = collections.deque()
 
     def reset(self):
         """Forget the request while keeping any send that is still in flight alive."""
@@ -117,20 +137,29 @@ class _Lane:
         self.half = None
         self.num_frames = 0
         self.abort_sent = False
+        self.abort_deadline = 0.0
         self.wait_since = 0.0
+        self.inbox.clear()
 
 
 class _Worker:
     role = ""
 
-    def __init__(self, connection, config):
+    def __init__(self, connection, peer_connection, config):
         self.connection = connection
+        self.peer_connection = peer_connection
         self.config = config
         self.device = torch.device("cuda", config.device_index)
         self.dtype = torch.bfloat16
         self.peer = 1 - config.rank
         self.lanes = {index: _Lane(index) for index in range(config.engine_config.lane_count)}
-        self.inbound = None
+        self.recv_stream = None
+        self._received_queue = queue.SimpleQueue()
+        self._main_wake = WakeSignal()
+        self._recv_stop = WakeSignal()
+        self._recv_stop_flag = threading.Event()
+        self._peer_recv_thread = None
+        self._clean_shutdown = False
         self.outbound_seq = FIRST_SEQ
         self.inbound_seq = FIRST_SEQ - 1
         self.retired = []
@@ -143,6 +172,9 @@ class _Worker:
             self._start_group()
             self._load()
             self._handshake()
+            if not self.running:
+                return
+            self._start_peer_receiver()
             self._start_background()
             threading.Thread(
                 target=self._watch_stall, name=f"{self.role}-stall", daemon=True
@@ -150,7 +182,10 @@ class _Worker:
             self._loop()
         finally:
             self._stop_background()
+            self._stop_peer_receiver()
             self._stop_group()
+            self._main_wake.close()
+            self._recv_stop.close()
 
     def _start_background(self):
         """Start whatever this worker runs beside its event loop."""
@@ -158,8 +193,12 @@ class _Worker:
     def _stop_background(self):
         """Stop it before the device is torn down."""
 
-    def _parked(self, lane):
-        """Whether this lane's work currently runs on another thread."""
+    def _drain_background(self):
+        """Relay any completions from worker background threads onto the engine pipe."""
+        return False
+
+    def _has_background_work(self):
+        """Whether work continues on background threads while all denoising lanes are idle."""
         return False
 
     def _watch_stall(self):
@@ -187,6 +226,7 @@ class _Worker:
     def _start_group(self):
         if self.device.type == "cuda":
             torch.cuda.set_device(self.device)
+            self.recv_stream = torch.cuda.Stream(device=self.device)
         timeout = timedelta(seconds=self.config.engine_config.startup_timeout_seconds)
         dist.init_process_group(
             backend="nccl" if self.device.type == "cuda" else "gloo",
@@ -218,11 +258,79 @@ class _Worker:
     def _stop_group(self):
         if not dist.is_initialized():
             return
-        for group in (getattr(self, "downstream", None), getattr(self, "upstream", None)):
+        groups = [
+            group
+            for group in (getattr(self, "downstream", None), getattr(self, "upstream", None))
+            if group is not None
+        ]
+        if self._clean_shutdown:
+            deadline = time.monotonic() + CLEAN_SHUTDOWN_DRAIN_SECONDS
+            while any(lane.sends for lane in self.lanes.values()):
+                for lane in self.lanes.values():
+                    self._reap(lane)
+                if not any(lane.sends for lane in self.lanes.values()) or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.005)
+            remaining_sends = sum(len(lane.sends) for lane in self.lanes.values())
+            if remaining_sends == 0:
+                for group in groups:
+                    dist.destroy_process_group(group)
+                dist.destroy_process_group()
+                return
+            logger.warning(
+                f"The {self.role} half still had {remaining_sends} pending send(s) at shutdown; aborting communicators"
+            )
+        for group in groups:
             abort = getattr(group, "abort", None)
             if abort is not None:
                 abort()
         dist.destroy_process_group()
+
+    def _start_peer_receiver(self):
+        self._peer_recv_thread = threading.Thread(
+            target=self._peer_recv_loop, name=f"{self.role}-recv", daemon=True
+        )
+        self._peer_recv_thread.start()
+
+    def _stop_peer_receiver(self):
+        self._recv_stop_flag.set()
+        self._recv_stop.set()
+        if self._peer_recv_thread is not None:
+            self._peer_recv_thread.join(timeout=5.0)
+            self._peer_recv_thread = None
+
+    def _peer_recv_loop(self):
+        """Read peer metadata and immediately post NCCL irecvs on recv_stream without waiting on compute."""
+        if self.device.type == "cuda":
+            torch.cuda.set_device(self.device)
+        try:
+            while not self._recv_stop_flag.is_set():
+                multiprocessing.connection.wait([self.peer_connection, self._recv_stop.read_fd])
+                if self._recv_stop_flag.is_set():
+                    return
+                while self.peer_connection.poll() and not self._recv_stop_flag.is_set():
+                    try:
+                        envelope = self.peer_connection.recv()
+                    except EOFError as error:
+                        if not self._recv_stop_flag.is_set():
+                            self._received_queue.put(("eof", error))
+                            self._main_wake.set()
+                        return
+                    transfer = post_recv(
+                        self.recv_group, self.peer, envelope, self.device, recv_stream=self.recv_stream
+                    )
+                    header = transfer.header
+                    if header.seq != self.inbound_seq + 1:
+                        raise RuntimeError(
+                            f"The {self.role} half expected message {self.inbound_seq + 1} on the data channel "
+                            f"but received {header.describe()}; the two halves have lost each other's place."
+                        )
+                    self.inbound_seq = header.seq
+                    self._received_queue.put(("transfer", transfer))
+                    self._main_wake.set()
+        except BaseException as error:
+            self._received_queue.put(("error", error))
+            self._main_wake.set()
 
     def _handshake(self):
         """Announce this worker and wait for the engine to confirm the split"""
@@ -240,6 +348,7 @@ class _Worker:
             # when the split does not fit its device. This half has nothing left to do, and
             # exiting cleanly keeps its own log from reading as the failure.
             logger.info(f"The engine stopped the {self.role} half before it was started")
+            self._clean_shutdown = True
             self.running = False
             return
         if kind != "start":
@@ -281,23 +390,41 @@ class _Worker:
         )
         return half
 
+    def _before_lanes(self):
+        """Hook called before scanning lanes so a worker can coordinate background work."""
+
+    def _ordered_lanes(self):
+        return self.lanes.values()
+
     def _loop(self):
         while self.running:
+            self._main_wake.clear()
             self._read_control()
-            self._advance_receive()
-            progressed = False
-            for lane in self.lanes.values():
+            if not self.running:
+                break
+            progressed = self._drain_recvs()
+            if self._drain_background():
+                progressed = True
+            self._before_lanes()
+            for lane in self._ordered_lanes():
                 if not self.running:
                     break
                 if self._advance(lane):
                     progressed = True
-                if self._parked(lane):
-                    progressed = True
+                    if self._drain_recvs():
+                        progressed = True
+                    self._before_lanes()
                 self._reap(lane)
-            if progressed:
+            if progressed or self._has_background_work():
                 self.last_progress = time.monotonic()
-            else:
-                time.sleep(IDLE_SLEEP_SECONDS)
+            if not progressed:
+                self._check_wait_timeout()
+                self._idle_wait()
+
+    def _idle_wait(self):
+        multiprocessing.connection.wait(
+            [self.connection, self._main_wake.read_fd], timeout=IDLE_SLEEP_SECONDS
+        )
 
     def _read_control(self):
         while self.connection.poll():
@@ -306,6 +433,7 @@ class _Worker:
     def _on_control(self, message):
         kind = message.get("kind")
         if kind == "shutdown":
+            self._clean_shutdown = True
             self.running = False
             return
         if kind == "cancel":
@@ -318,7 +446,7 @@ class _Worker:
         lane = self.lanes.get(lane_index)
         if lane is None or lane.request_id != request_id:
             return
-        if lane.state in ("idle", "decoding"):
+        if lane.state == "idle":
             return
         if lane.state == "done":
             self._release(lane)
@@ -334,51 +462,50 @@ class _Worker:
 
     def _advance_abort(self, lane):
         """Wait briefly for the other worker's abort so both streams stay paired."""
-        armed = self._wait_for_message(lane)
         if time.monotonic() >= lane.abort_deadline:
             self._release(lane)
-        return armed
-
-    def _wait_for_message(self, lane):
-        """Arm this worker's receive for the message the lane waits on, and note the wait."""
-        if not lane.wait_since:
-            lane.wait_since = time.monotonic()
-        if self.inbound is None:
-            self.inbound = Inbound(self.recv_group, self.peer, self.device)
             return True
         return False
 
-    def _advance_receive(self):
-        if self.inbound is None:
-            return
-        message = self.inbound.poll()
-        if message is None:
-            waiting = [lane for lane in self.lanes.values() if lane.wait_since]
-            if waiting:
-                oldest = min(waiting, key=lambda lane: lane.wait_since)
-                waited = time.monotonic() - oldest.wait_since
-                if waited > self.config.engine_config.message_timeout_seconds:
-                    lanes = {lane.index: lane.state for lane in waiting}
-                    raise RuntimeError(
-                        f"The {self.role} half waited {waited:.0f}s for a message from the other half and "
-                        f"none arrived; lane(s) {lanes} were still waiting, so the pipeline is stuck."
-                    )
-            return
-        self.inbound = None
-        self.last_progress = time.monotonic()
-        header, tensors = message
-        if header.seq != self.inbound_seq + 1:
-            raise RuntimeError(
-                f"The {self.role} half expected message {self.inbound_seq + 1} on the data channel but "
-                f"received {header.describe()}; the two halves have lost each other's place."
-            )
-        self.inbound_seq = header.seq
+    def _wait_for_message(self, lane):
+        """Deliver the lane's next buffered peer transfer via GPU stream sync, or mark wait start."""
+        if lane.inbox:
+            lane.wait_since = 0.0
+            header, tensors = lane.inbox.popleft().finish()
+            self._accept(lane, header, tensors)
+            return True
+        if not lane.wait_since:
+            lane.wait_since = time.monotonic()
+        return False
+
+    def _drain_recvs(self):
+        """Move posted peer transfers from the receiver thread into each lane's inbox in wire order."""
+        progressed = False
+        while True:
+            try:
+                kind, payload = self._received_queue.get_nowait()
+            except queue.Empty:
+                return progressed
+            if kind == "error":
+                raise payload
+            if kind == "eof":
+                self._read_control()
+                if not self.running:
+                    return progressed
+                raise RuntimeError(
+                    f"The {self.role} half lost its peer channel while the worker was still running."
+                ) from payload
+            self.last_progress = time.monotonic()
+            self._route_message(payload)
+            progressed = True
+
+    def _route_message(self, transfer):
+        header = transfer.header
         lane = self.lanes.get(header.lane)
         if lane is None:
             raise RuntimeError(
                 f"The {self.role} half received {header.describe()} for a lane it does not have."
             )
-        lane.wait_since = 0.0
         if lane.state == "idle" or lane.request_id != header.request_id:
             if header.request_id not in self.retired:
                 raise RuntimeError(
@@ -388,13 +515,36 @@ class _Worker:
                 )
             logger.debug(f"The {self.role} half dropped a stale {header.describe()} from a retired request.")
             return
-        if lane.state == "aborting" and header.kind != KIND_ABORT:
-            logger.debug(
-                f"The {self.role} half drained a stale {header.describe()} while aborting "
-                f"request {header.request_id}."
-            )
+        if lane.state == "aborting":
+            if header.kind == KIND_ABORT:
+                lane.wait_since = 0.0
+                resolved_header, tensors = transfer.finish()
+                self._accept(lane, resolved_header, tensors)
+            else:
+                logger.debug(
+                    f"The {self.role} half drained a stale {header.describe()} while aborting "
+                    f"request {header.request_id}."
+                )
             return
-        self._accept(lane, header, tensors)
+        if header.kind == KIND_ABORT:
+            lane.wait_since = 0.0
+            resolved_header, tensors = transfer.finish()
+            self._accept(lane, resolved_header, tensors)
+            return
+        lane.inbox.append(transfer)
+
+    def _check_wait_timeout(self):
+        waiting = [lane for lane in self.lanes.values() if lane.wait_since]
+        if not waiting:
+            return
+        oldest = min(waiting, key=lambda lane: lane.wait_since)
+        waited = time.monotonic() - oldest.wait_since
+        if waited > self.config.engine_config.message_timeout_seconds:
+            lanes = {lane.index: lane.state for lane in waiting}
+            raise RuntimeError(
+                f"The {self.role} half waited {waited:.0f}s for a message from the other half and "
+                f"none arrived; lane(s) {lanes} were still waiting, so the pipeline is stuck."
+            )
 
     def _send_message(self, lane, kind, tensors, *, stage, step, **fields):
         seq = self.outbound_seq
@@ -409,14 +559,14 @@ class _Worker:
             seq=seq,
             **fields,
         )
-        send = post_send(self.send_group, self.peer, header, list(tensors), self.device)
+        send = post_send(self.send_group, self.peer, self.peer_connection, header, list(tensors))
         lane.sends.append(send)
         return header
 
     def _reap(self, lane):
         """Drop the sends the other worker has taken delivery of, releasing their buffers."""
-        if lane.sends:
-            lane.sends = [send for send in lane.sends if not send.complete()]
+        while lane.sends and lane.sends[0].complete():
+            lane.sends.popleft()
 
     def _send(self, message):
         self.connection.send(message)
@@ -429,28 +579,26 @@ class _Worker:
             if time.monotonic() > deadline:
                 raise RuntimeError(f"The engine did not answer the {self.role} half within {timeout:.0f}s.")
 
-    def _release(self, lane):
+    def _release(self, lane, *, notify=True, close_capture=True):
         if lane.request_id:
-            self._send({
-                "kind": "released",
-                "role": self.role,
-                "request_id": lane.request_id,
-                "lane": lane.index,
-            })
+            if notify:
+                self._send({
+                    "kind": "released",
+                    "role": self.role,
+                    "request_id": lane.request_id,
+                    "lane": lane.index,
+                })
             self.retired = (self.retired + [lane.request_id])[-RETIRED_REQUESTS:]
             logger.debug(f"Request {lane.request_id} released the {self.role} lane {lane.index}")
-            release_lane(lane.index, lane.request_id)
+            release_lane(lane.index, lane.request_id, close_capture=close_capture)
         lane.reset()
 
     def _fail(self, lane, error):
         """Report a request-level failure and stop talking to the other worker."""
         logger.exception(f"Request {lane.request_id} failed on the {self.role} half: {type(error).__name__}: {error}")
-        if lane.state != "aborting":
-            lane.state = "aborting"
-            lane.abort_deadline = time.monotonic() + CANCEL_GRACE_SECONDS
-            if not lane.abort_sent:
-                self._send_message(lane, KIND_ABORT, [], stage=0, step=0)
-                lane.abort_sent = True
+        if not lane.abort_sent:
+            self._send_message(lane, KIND_ABORT, [], stage=0, step=0)
+            lane.abort_sent = True
         self._send({
             "kind": "failed",
             "role": self.role,
@@ -482,8 +630,8 @@ class FrontWorker(_Worker):
     """Runs the first GPU's work: text encoding, the input projection and the leading blocks."""
     role = "front"
 
-    def __init__(self, connection, config):
-        super().__init__(connection, config)
+    def __init__(self, connection, peer_connection, config):
+        super().__init__(connection, peer_connection, config)
         self.front = None
 
     def _load(self):
@@ -494,6 +642,9 @@ class FrontWorker(_Worker):
 
     def _on_lane_control(self, message):
         kind = message.get("kind")
+        if kind == "request_finished":
+            finish_request(message["request_id"])
+            return
         lane = self.lanes[message["lane"]]
         if kind == "admit":
             self._admit_lane(lane, message, "preparing")
@@ -504,7 +655,7 @@ class FrontWorker(_Worker):
             lane.state = "running"
         elif kind == "finish":
             if lane.request_id == message["request_id"] and lane.state != "idle":
-                self._release(lane)
+                self._release(lane, close_capture=not message.get("decoding", False))
 
     def _advance(self, lane):
         if lane.state in ("idle", "done", "waiting_start"):
@@ -564,7 +715,14 @@ class FrontWorker(_Worker):
     def _run_pass(self, lane):
         plan = self.front.next_plan(lane.half)
         if plan is None:
-            # second GPU now owes the step's latents.
+            if (
+                lane.half.stage == 0
+                and lane.half.settings.higher_resolution
+                and lane.half.step_index == len(lane.half.timesteps) - 1
+            ):
+                lane.state = "transitioning"
+                return self._transition(lane)
+            # Final request step finishes on the second GPU via decode/finished control notification.
             lane.state = "waiting_latents"
             return self._wait_for_message(lane)
         with span(f"pass {plan.name} b{plan.batch}"):
@@ -603,16 +761,6 @@ class FrontWorker(_Worker):
     def _transition(self, lane):
         with span("transition"):
             self.front.transition(lane.half)
-        # The barrier is a marker rather than a payload: both GPUs derive the refinement noise
-        # from the request's seed, and this message is what tells the second GPU to go first.
-        self._send_message(
-            lane,
-            KIND_REFINE_NOISE,
-            [],
-            stage=1,
-            step=0,
-            steps_total=len(lane.half.timesteps),
-        )
         lane.state = "waiting_state"
         return True
 
@@ -634,13 +782,12 @@ class FrontWorker(_Worker):
                         f"{lane.half.step_index}, received stage {header.stage + 1} step {header.step}."
                     )
                 finished = self.front.adopt_step_latents(lane.half, tensors[0], tensors[1])
-                if not finished:
-                    lane.state = "running"
-                    return
-                if lane.half.stage == 0 and lane.half.settings.higher_resolution:
-                    lane.state = "transitioning"
-                    return
-                self._finish(lane)
+                if finished:
+                    raise RuntimeError(
+                        f"Request {lane.request_id} received unexpected terminal latents for stage "
+                        f"{header.stage + 1} step {header.step}."
+                    )
+                lane.state = "running"
                 return
             if lane.state == "waiting_state" and header.kind == KIND_STATE:
                 if header.stage != 1:
@@ -658,22 +805,30 @@ class FrontWorker(_Worker):
         except Exception as error:
             self._fail(lane, error)
 
-    def _finish(self, lane):
-        lane.state = "done"
-        logger.debug(f"Request {lane.request_id} finished its denoising on the front half")
-
 
 class BackWorker(_Worker):
     """Runs the second GPU's work: the trailing blocks, the samplers, the decoders and the files."""
     role = "back"
 
-    def __init__(self, connection, config):
-        super().__init__(connection, config)
+    def __init__(self, connection, peer_connection, config):
+        super().__init__(connection, peer_connection, config)
         self.back = None
         self.decode_stream = None
         self.decode_queue = queue.SimpleQueue()
-        self.decode_jobs = {}
+        self.write_queue = queue.SimpleQueue()
+        self.completed_jobs = queue.SimpleQueue()
+        self._decode_cond = threading.Condition()
+        self._pending_decodes = 0
+        self._decode_active = False
+        self._decode_yield_requested = False
+        self._decode_stopping = False
+        self._active_denoise_lanes = 0
+        self._main_gpu_idle_event = None
+        self._inflight_decodes = 0
+        self._pinned_video_pool = queue.SimpleQueue()
+        self._pinned_audio_pool = queue.SimpleQueue()
         self.decode_thread = None
+        self.write_thread = None
 
     def _load(self):
         self.back = self._load_half(
@@ -683,45 +838,200 @@ class BackWorker(_Worker):
 
     def _start_background(self):
         if self.device.type == "cuda":
-            self.decode_stream = torch.cuda.Stream(device=self.device)
+            self.decode_stream = torch.cuda.Stream(device=self.device, priority=0)
         self.decode_thread = threading.Thread(
             target=self._decode_loop, name=f"{self.role}-decode", daemon=True
         )
+        self.write_thread = threading.Thread(
+            target=self._write_loop, name=f"{self.role}-write", daemon=True
+        )
         self.decode_thread.start()
+        self.write_thread.start()
 
     def _stop_background(self):
+        with self._decode_cond:
+            self._decode_stopping = True
+            self._decode_cond.notify_all()
         self.decode_queue.put(None)
         if self.decode_thread is not None:
             self.decode_thread.join(timeout=self.config.engine_config.decode_shutdown_seconds)
+        if self.write_thread is not None:
+            self.write_thread.join(timeout=self.config.engine_config.decode_shutdown_seconds)
+        for pool in (self._pinned_video_pool, self._pinned_audio_pool):
+            while True:
+                try:
+                    pool.get_nowait()
+                except queue.Empty:
+                    break
 
-    def _parked(self, lane):
-        return lane.index in self.decode_jobs
+    def _has_background_work(self):
+        return self._inflight_decodes > 0
+
+    def _drain_background(self):
+        drained = False
+        while True:
+            try:
+                event = self.completed_jobs.get_nowait()
+            except queue.Empty:
+                return drained
+            self._inflight_decodes -= 1
+            self._send(event)
+            drained = True
+
+    @staticmethod
+    def _acquire_pinned(pool, numel, dtype):
+        while True:
+            try:
+                buf = pool.get_nowait()
+            except queue.Empty:
+                return torch.empty(numel, dtype=dtype, pin_memory=True)
+            if buf.dtype == dtype and buf.numel() >= numel:
+                return buf
+
+    @staticmethod
+    def _release_pinned(pool, buf):
+        if buf is not None and pool.qsize() < PINNED_POOL_LIMIT:
+            pool.put(buf)
 
     def _decode_loop(self):
-        """Decode and write one lane's output at a time, off the event loop."""
+        if self.device.type == "cuda":
+            torch.cuda.set_device(self.device)
+        try:
+            while True:
+                job = self.decode_queue.get()
+                if job is None:
+                    return
+                with self._decode_cond:
+                    while (
+                        not self._decode_stopping
+                        and self._active_denoise_lanes > 0
+                        and not self._decode_yield_requested
+                    ):
+                        self._decode_cond.wait()
+                    if self._decode_stopping:
+                        return
+                    self._decode_active = True
+                    yield_event = self._main_gpu_idle_event
+                    self._main_gpu_idle_event = None
+                stream = self.decode_stream
+                video_buf = None
+                audio_buf = None
+                try:
+                    if stream is not None:
+                        if job.ready_event is not None:
+                            stream.wait_event(job.ready_event)
+                        if yield_event is not None:
+                            stream.wait_event(yield_event)
+                    scope = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+                    with scope:
+                        with span("decode"):
+                            video, audio = self.back.decode(job.payload)
+                        job.payload = None
+                        video_uint8 = (
+                            video[0]
+                            .detach()
+                            .clamp_(-1.0, 1.0)
+                            .add_(1.0)
+                            .mul_(127.5)
+                            .to(torch.uint8)
+                            .permute(1, 2, 3, 0)
+                            .contiguous()
+                        )
+                        del video
+                        audio_int16 = (
+                            audio[0]
+                            .detach()
+                            .float()
+                            .clamp_(-1.0, 1.0)
+                            .mul_(32767.0)
+                            .to(torch.int16)
+                            .contiguous()
+                        )
+                        del audio
+                        if stream is not None:
+                            video_buf = self._acquire_pinned(
+                                self._pinned_video_pool, video_uint8.numel(), torch.uint8
+                            )
+                            audio_buf = self._acquire_pinned(
+                                self._pinned_audio_pool, audio_int16.numel(), torch.int16
+                            )
+                            video_host = video_buf[: video_uint8.numel()].view(video_uint8.shape)
+                            audio_host = audio_buf[: audio_int16.numel()].view(audio_int16.shape)
+                            video_host.copy_(video_uint8, non_blocking=True)
+                            audio_host.copy_(audio_int16, non_blocking=True)
+                            copy_done = torch.cuda.Event()
+                            copy_done.record(stream)
+                            del video_uint8, audio_int16
+                            copy_done.synchronize()
+                            video_frames = video_host.numpy()
+                            audio_samples = audio_host.numpy()
+                        else:
+                            video_frames = video_uint8.cpu().numpy()
+                            audio_samples = audio_int16.cpu().numpy()
+                            del video_uint8, audio_int16
+                except BaseException as error:
+                    self._release_pinned(self._pinned_video_pool, video_buf)
+                    self._release_pinned(self._pinned_audio_pool, audio_buf)
+                    logger.exception(f"Request {job.request} failed while decoding")
+                    self.completed_jobs.put({
+                        "kind": "decode_failed",
+                        "role": self.role,
+                        "request_id": job.request,
+                        "error": f"{type(error).__name__}: {error}",
+                    })
+                    self._main_wake.set()
+                else:
+                    self.write_queue.put(_WriteJob(
+                        request=job.request,
+                        output_name=job.output_name,
+                        video_frames=video_frames,
+                        audio_samples=audio_samples,
+                        started=job.started,
+                        video_buffer=video_buf,
+                        audio_buffer=audio_buf,
+                    ))
+                finally:
+                    with self._decode_cond:
+                        self._pending_decodes -= 1
+                        self._decode_active = False
+                        self._decode_yield_requested = False
+                        self._decode_cond.notify_all()
+                    self._main_wake.set()
+        finally:
+            self.write_queue.put(None)
+
+    def _write_loop(self):
         while True:
-            job = self.decode_queue.get()
+            job = self.write_queue.get()
             if job is None:
                 return
-            stream = self.decode_stream
             try:
-                if stream is not None:
-                    # The latents were produced on the event loop's stream, so this waits for
-                    # them before reading them on another one.
-                    stream.wait_stream(torch.cuda.current_stream())
-                scope = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
-                with scope:
-                    with span("decode"):
-                        video, audio = self.back.decode(job.half)
-                    with span("write"):
-                        files = self._write(job.request, job.output_name, video, audio)
+                with span("write"):
+                    files = self._write(job.request, job.output_name, job.video_frames, job.audio_samples)
             except BaseException as error:
-                logger.exception(f"Request {job.request} failed while decoding")
-                job.error = f"{type(error).__name__}: {error}"
+                logger.exception(f"Request {job.request} failed while writing output files")
+                self.completed_jobs.put({
+                    "kind": "decode_failed",
+                    "role": self.role,
+                    "request_id": job.request,
+                    "error": f"{type(error).__name__}: {error}",
+                })
+                self._main_wake.set()
             else:
-                job.files = files
-            job.seconds = time.monotonic() - job.started
-            job.done.set()
+                elapsed = time.monotonic() - job.started
+                logger.debug(f"Request {job.request} decoded and wrote in {elapsed:.2f}s")
+                self.completed_jobs.put({
+                    "kind": "completed",
+                    "role": self.role,
+                    "request_id": job.request,
+                    **files,
+                })
+                self._main_wake.set()
+            finally:
+                job.video_frames = None
+                job.audio_samples = None
+                self._release_pinned(self._pinned_video_pool, job.video_buffer)
+                self._release_pinned(self._pinned_audio_pool, job.audio_buffer)
 
     def _on_lane_control(self, message):
         kind = message.get("kind")
@@ -736,20 +1046,80 @@ class BackWorker(_Worker):
             lane.num_frames = message["num_frames"]
             lane.state = "preparing"
 
+    def _is_stage_transition_pending(self, lane):
+        return (
+            lane.state == "running"
+            and self.back.next_plan(lane.half) is None
+            and lane.half.stage == 0
+            and lane.settings.higher_resolution
+            and lane.half.step_index + 1 >= len(lane.half.timesteps)
+        )
+
+    def _has_fast_combine(self):
+        return any(
+            lane.state == "running"
+            and self.back.next_plan(lane.half) is None
+            and not self._is_stage_transition_pending(lane)
+            for lane in self.lanes.values()
+        )
+
+    def _lane_priority(self, lane):
+        if lane.state == "running":
+            plan = self.back.next_plan(lane.half)
+            if plan is None:
+                return 0 if not self._is_stage_transition_pending(lane) else 1
+            if lane.inbox and len(lane.half.queue) == 1:
+                return 2
+            if not plan.needs_front:
+                return 3
+        elif lane.state == "preparing" or (lane.state == "starting" and lane.inbox):
+            return 3
+        return 4
+
+    def _ordered_lanes(self):
+        return sorted(self.lanes.values(), key=lambda lane: (self._lane_priority(lane), lane.index))
+
+    def _before_lanes(self):
+        active = sum(1 for lane in self.lanes.values() if lane.state not in ("idle", "done"))
+        with self._decode_cond:
+            self._active_denoise_lanes = active
+            should_wake = (
+                (active == 0 and self._pending_decodes > 0 and not self._decode_active)
+                or (
+                    self._pending_decodes >= self.config.engine_config.lane_count
+                    and not self._decode_active
+                    and not self._decode_yield_requested
+                    and not self._has_fast_combine()
+                )
+            )
+            if should_wake:
+                if self.device.type == "cuda":
+                    event = torch.cuda.Event()
+                    event.record(torch.cuda.current_stream(self.device))
+                    self._main_gpu_idle_event = event
+                if active > 0:
+                    self._decode_yield_requested = True
+                self._decode_cond.notify_all()
+
+    def _check_wait_timeout(self):
+        if self._decode_active or self._decode_yield_requested:
+            return
+        super()._check_wait_timeout()
+
     def _advance(self, lane):
         if lane.state in ("idle", "done", "waiting_frames"):
             return False
         if lane.state == "aborting":
             return self._advance_abort(lane)
+        if self._decode_active or self._decode_yield_requested:
+            return False
         try:
             if lane.state == "preparing":
                 return self._prepare(lane)
             if lane.state == "running":
                 return self._run(lane)
-            if lane.state in ("starting", "waiting_refine"):
+            if lane.state == "starting":
                 return self._wait_for_message(lane)
-            if lane.state == "decoding":
-                return self._collect_decode(lane)
         except Exception as error:
             self._fail(lane, error)
             return True
@@ -781,6 +1151,8 @@ class BackWorker(_Worker):
             self.back.run_local(lane.half, plan)
         self.back.finish_pass(lane.half, plan)
         logger.debug(f"Request {lane.request_id}: ran {plan.describe()} locally at step {lane.half.step_index + 1}")
+        if self.back.next_plan(lane.half) is None and not self._is_stage_transition_pending(lane):
+            self._finish_step(lane)
         return True
 
     def _finish_step(self, lane):
@@ -792,62 +1164,64 @@ class BackWorker(_Worker):
         with span("combine"):
             video, audio = self.back.finish_step(lane.half)
         done = lane.half.step_index >= len(lane.half.timesteps)
-        self._send_message(
-            lane,
-            KIND_LATENTS,
-            [video, audio],
-            stage=lane.half.stage,
-            step=finished_step,
-            steps_total=len(lane.half.timesteps),
-        )
         logger.debug(
             f"Request {lane.request_id}: finished stage {lane.half.stage + 1} step "
             f"{finished_step + 1}/{len(lane.half.timesteps)}"
         )
         if not done:
+            self._send_message(
+                lane,
+                KIND_LATENTS,
+                [video, audio],
+                stage=lane.half.stage,
+                step=finished_step,
+                steps_total=len(lane.half.timesteps),
+            )
             self.back.begin_step(lane.half)
             return True
         if lane.half.stage == 0 and lane.settings.higher_resolution:
-            # The other GPU only learns that refinement was asked for when this noise arrives,
-            # so this half waits for the first GPU's barrier before it builds the next stage.
-            lane.state = "waiting_refine"
+            with span("refine/upsample"):
+                video, audio = self.back.begin_refinement(lane.half)
+            self._send_message(
+                lane,
+                KIND_STATE,
+                [video, audio],
+                stage=1,
+                step=0,
+                steps_total=len(lane.half.timesteps),
+            )
             return True
-        lane.state = "decoding"
         self._start_decode(lane)
+        self._send({
+            "kind": "denoised",
+            "role": self.role,
+            "request_id": lane.request_id,
+            "lane": lane.index,
+        })
+        self._release(lane, notify=False, close_capture=False)
         return True
 
     def _start_decode(self, lane):
-        """Hand a finished lane's latents to the decode thread"""
+        ready_event = None
+        payload = self.back.decode_payload(lane.half)
+        if self.device.type == "cuda":
+            ready_event = torch.cuda.Event()
+            ready_event.record(torch.cuda.current_stream(self.device))
+            if self.decode_stream is not None:
+                payload.latents.record_stream(self.decode_stream)
+                payload.audio_latents.record_stream(self.decode_stream)
         job = _DecodeJob(
-            lane=lane.index,
             request=lane.request_id,
-            half=lane.half,
+            payload=payload,
             output_name=lane.settings.output_name,
             started=time.monotonic(),
+            ready_event=ready_event,
         )
-        self.decode_jobs[lane.index] = job
-        self.decode_queue.put(job)
-
-    def _collect_decode(self, lane):
-        """Take a decode's result, publish its files and let the lane go."""
-        job = self.decode_jobs.get(lane.index)
-        if job is None:
-            raise RuntimeError(f"The back lane {lane.index} is decoding with no decode in flight.")
-        if not job.done.is_set():
-            return False
-        del self.decode_jobs[lane.index]
-        if job.error:
-            raise RuntimeError(f"Request {job.request} failed while decoding: {job.error}")
-        logger.debug(f"Request {job.request} decoded and wrote in {job.seconds:.2f}s")
-        self._send({
-            "kind": "completed",
-            "role": self.role,
-            "request_id": job.request,
-            "lane": lane.index,
-            **job.files,
-        })
-        self._release(lane)
-        return True
+        self._inflight_decodes += 1
+        with self._decode_cond:
+            self._pending_decodes += 1
+            self.decode_queue.put(job)
+            self._decode_cond.notify_all()
 
     def _accept(self, lane, header, tensors):
         try:
@@ -870,18 +1244,8 @@ class BackWorker(_Worker):
                 with span(f"pass {plan.name} b{plan.batch}"):
                     self.back.accept_pass(lane.half, plan, header, tensors)
                 self.back.finish_pass(lane.half, plan)
-                return
-            if lane.state == "waiting_refine" and header.kind == KIND_REFINE_NOISE:
-                if tensors:
-                    raise RuntimeError(
-                        f"Request {lane.request_id} received {len(tensors)} refinement tensor(s); the "
-                        "barrier carries a marker, because each half derives the noise from the seed."
-                    )
-                with span("refine/upsample"):
-                    video, audio, _ = self.back.begin_refinement(lane.half)
-                self._send_message(lane, KIND_STATE, [video, audio], stage=1, step=0,
-                                   steps_total=len(lane.half.timesteps))
-                lane.state = "running"
+                if self.back.next_plan(lane.half) is None and not self._is_stage_transition_pending(lane):
+                    self._finish_step(lane)
                 return
             raise RuntimeError(
                 f"Request {lane.request_id} on the back half received an unexpected {header.describe()} "
@@ -890,7 +1254,7 @@ class BackWorker(_Worker):
         except Exception as error:
             self._fail(lane, error)
 
-    def _write(self, request_id, output_name, video, audio):
+    def _write(self, request_id, output_name, video_frames, audio_samples):
         results_dir = Path(self.config.results_dir)
         video_path = results_dir / output_name
         audio_path = video_path.with_suffix(".wav")
@@ -899,13 +1263,13 @@ class BackWorker(_Worker):
         results_dir.mkdir(parents=True, exist_ok=True)
         if video_path.exists() or audio_path.exists():
             raise FileExistsError(f"Request {request_id} output already exists in {results_dir}.")
-        frames = video.shape[2]
+        frames = int(video_frames.shape[0])
         duration_seconds = frames / self.config.engine_config.frame_rate
         video_published = False
         audio_published = False
         try:
-            self._save_video(video, temporary_video_path)
-            self._save_audio(audio, temporary_audio_path)
+            self._save_video(video_frames, temporary_video_path)
+            self._save_audio(audio_samples, temporary_audio_path)
             temporary_video_path.replace(video_path)
             video_published = True
             temporary_audio_path.replace(audio_path)
@@ -929,16 +1293,13 @@ class BackWorker(_Worker):
             "duration_seconds": duration_seconds,
         }
 
-    def _save_video(self, video, path):
-        frames = video[0].detach().float().cpu()
-        frames = (frames.clamp(-1, 1) + 1) / 2 * 255
-        frames = frames.to(torch.uint8).permute(1, 2, 3, 0).numpy()
-        imageio.mimsave(str(path), list(frames), fps=self.config.engine_config.frame_rate)
+    def _save_video(self, frames, path):
+        with imageio.get_writer(str(path), fps=self.config.engine_config.frame_rate) as writer:
+            for frame in frames:
+                writer.append_data(frame)
 
-    def _save_audio(self, audio, path):
+    def _save_audio(self, samples, path):
         sample_rate = self.back.vocoder.config.output_sampling_rate
-        waveform = audio[0].detach().float().cpu().clamp(-1, 1)
-        samples = (waveform * 32767).to(torch.int16).numpy()
         with wave.open(str(path), "wb") as wav_file:
             wav_file.setnchannels(samples.shape[0])
             wav_file.setsampwidth(2)

@@ -9,9 +9,7 @@ from src.model.lora import lora_strength
 from src.model.pipeline import (
     pack_audio_latents,
     pack_video_latents,
-    select_positive_branch,
     stage_one_timesteps,
-    stage_two_timesteps,
 )
 from src.parallelism.half import Half, LaneState
 from src.parallelism.partition import (
@@ -28,7 +26,10 @@ logger = get_logger(__name__)
 class FrontLane(LaneState):
     prompt_embeds: torch.Tensor
     audio_prompt_embeds: torch.Tensor
-    attention_mask: torch.Tensor
+    attention_mask: Optional[torch.Tensor]
+    pos_prompt_embeds: torch.Tensor
+    pos_audio_prompt_embeds: torch.Tensor
+    pos_attention_mask: Optional[torch.Tensor]
     raw_prompt_embeds: Optional[torch.Tensor]
     raw_prompt_attention_mask: Optional[torch.Tensor]
     keyframes_mask: torch.Tensor
@@ -58,6 +59,7 @@ class FrontHalf(Half):
         self.text_encoder = text_encoder
         self.connectors = connectors
         self.duration_head = duration_head
+        self._negative_cache = {}
 
     def _validate(self, settings):
         self._check_crop_size(settings)
@@ -91,10 +93,20 @@ class FrontHalf(Half):
         logger.debug(f"Prompt embeds shape: {tuple(prompt_embeds.shape)}")
         return prompt_embeds, attention_mask
 
-    def _predict_duration(self, video_tokens, audio_tokens, text_guidance):
-        video_tokens = select_positive_branch(video_tokens, text_guidance)
-        audio_tokens = select_positive_branch(audio_tokens, text_guidance)
+    def _predict_duration(self, video_tokens, audio_tokens):
         return self.duration_head(video_tokens[:1], audio_tokens[:1]).item()
+
+    @torch.no_grad()
+    def _encode_negative(self, settings):
+        key = (settings.negative_prompt, settings.max_sequence_length)
+        cached = self._negative_cache.get(key)
+        if cached is not None:
+            return cached
+        neg_embeds, neg_mask = self.encode_text(settings.negative_prompt, settings.max_sequence_length)
+        with lora_strength(0.0):
+            cached = self.connectors(neg_embeds, neg_mask, padding_side="left")
+        self._negative_cache[key] = cached
+        return cached
 
     def _keyframes_mask(self, video_grid):
         # The checkpoint marks the first latent frame as a reference frame and the marker
@@ -109,23 +121,35 @@ class FrontHalf(Half):
         self._validate(settings)
         device = self.device
         generator = torch.Generator(device=device).manual_seed(settings.seed)
-        prompt_embeds, attention_mask = self.encode_text(settings.prompt, settings.max_sequence_length)
-        raw_prompt_embeds = prompt_embeds
-        raw_prompt_attention_mask = attention_mask
-        negative_embeds, negative_mask = self.encode_text(
-            settings.negative_prompt, settings.max_sequence_length
+        raw_prompt_embeds, raw_prompt_attention_mask = self.encode_text(
+            settings.prompt, settings.max_sequence_length
         )
+        with lora_strength(0.0):
+            pos_video, pos_audio, pos_mask = self.connectors(
+                raw_prompt_embeds, raw_prompt_attention_mask, padding_side="left"
+            )
         text_guidance = uses_text_guidance(settings)
         if text_guidance:
-            prompt_embeds = torch.cat([negative_embeds, prompt_embeds], dim=0)
-            attention_mask = torch.cat([negative_mask, attention_mask], dim=0)
-        video_prompt, audio_prompt, connector_mask = self.connectors(
-            prompt_embeds, attention_mask, padding_side="left"
-        )
+            neg_video, neg_audio, neg_mask = self._encode_negative(settings)
+            video_prompt = torch.cat([neg_video, pos_video], dim=0)
+            audio_prompt = torch.cat([neg_audio, pos_audio], dim=0)
+            connector_mask = (
+                None if (neg_mask is None and pos_mask is None) else torch.cat([neg_mask, pos_mask], dim=0)
+            )
+        else:
+            video_prompt, audio_prompt, connector_mask = pos_video, pos_audio, pos_mask
         requested = settings.duration_seconds
         if requested is None:
-            requested = self._predict_duration(video_prompt, audio_prompt, text_guidance)
+            requested = self._predict_duration(pos_video, pos_audio)
             logger.debug(f"Predicted duration {requested:.2f}s")
+        with lora_strength(0.0):
+            video_prompt, audio_prompt = self.transformer.project_prompts(video_prompt, audio_prompt)
+        if text_guidance:
+            pos_video = video_prompt[1:].clone()
+            pos_audio = audio_prompt[1:].clone()
+        else:
+            pos_video = video_prompt
+            pos_audio = audio_prompt
         try:
             requested = float(requested)
         except (TypeError, ValueError) as error:
@@ -187,6 +211,9 @@ class FrontHalf(Half):
             prompt_embeds=video_prompt,
             audio_prompt_embeds=audio_prompt,
             attention_mask=connector_mask,
+            pos_prompt_embeds=pos_video,
+            pos_audio_prompt_embeds=pos_audio,
+            pos_attention_mask=pos_mask,
             raw_prompt_embeds=raw_prompt_embeds,
             raw_prompt_attention_mask=raw_prompt_attention_mask,
             latents=latents,
@@ -235,18 +262,16 @@ class FrontHalf(Half):
         """
         timestep = lane.timesteps[lane.step_index]
         batch = plan.batch
-        # The CFG pass carries both the negative and the positive prompt, so its embeddings
-        # describe two samples. Every other pass runs the positive sample alone and takes
-        # the positive branch of those same embeddings.
-        text_guidance = uses_text_guidance(lane.stage_settings)
+        # The CFG pass carries both the negative and the positive prompt when text guidance is on.
+        # Every other pass runs the positive sample alone.
         if plan.name == "cfg":
             prompt_embeds = lane.prompt_embeds
             audio_prompt_embeds = lane.audio_prompt_embeds
             attention_mask = lane.attention_mask
         else:
-            prompt_embeds = select_positive_branch(lane.prompt_embeds, text_guidance)
-            audio_prompt_embeds = select_positive_branch(lane.audio_prompt_embeds, text_guidance)
-            attention_mask = select_positive_branch(lane.attention_mask, text_guidance)
+            prompt_embeds = lane.pos_prompt_embeds
+            audio_prompt_embeds = lane.pos_audio_prompt_embeds
+            attention_mask = lane.pos_attention_mask
         latent_model_input = torch.cat([lane.latents] * batch).to(self.dtype)
         audio_model_input = torch.cat([lane.audio_latents] * batch).to(self.dtype)
         timestep = timestep.expand(batch)
@@ -268,6 +293,7 @@ class FrontHalf(Half):
                 audio_encoder_attention_mask=attention_mask,
                 video_keyframes_mask=lane.keyframes_mask,
                 use_cross_timestep=True,
+                prompts_projected=True,
             )
             # Every cached pass has to run its leading blocks and make the decision at the
             # cache boundary. Telling a follower pass to reuse before it reaches that
@@ -317,6 +343,9 @@ class FrontHalf(Half):
     @torch.no_grad()
     def transition(self, lane):
         """Turn a finished coarse stage into the refinement stage."""
+        end_step(lane.lane)
+        if lane.cache is not None:
+            lane.cache.reset("end of stage 1")
         settings = lane.settings
         stage_settings = stage2_settings(settings)
         refined = lane.video_grid.refined()
@@ -326,20 +355,19 @@ class FrontHalf(Half):
                 lane.raw_prompt_attention_mask,
                 padding_side="left",
             )
+            video_prompt, audio_prompt = self.transformer.project_prompts(video_prompt, audio_prompt)
         lane.raw_prompt_embeds = None
         lane.raw_prompt_attention_mask = None
         lane.stage = 1
         lane.stage_settings = stage_settings
-        lane.prompt_embeds = video_prompt
-        lane.audio_prompt_embeds = audio_prompt
-        lane.attention_mask = connector_mask
+        lane.prompt_embeds = lane.pos_prompt_embeds = video_prompt
+        lane.audio_prompt_embeds = lane.pos_audio_prompt_embeds = audio_prompt
+        lane.attention_mask = lane.pos_attention_mask = connector_mask
         # The refinement stage runs the same plans with no cache at all.
         lane.passes = self._stage_passes(stage_settings, None)
         lane.queue = []
         lane.step_reuse = False
-        lane.timesteps = stage_two_timesteps(
-            self.model_config.scheduler, self.engine_config.stage2_sigmas, self.device
-        )
+        lane.timesteps = self._stage2_timesteps
         lane.step_index = 0
         lane.cache = None
         lane.conditioning_sent = set()

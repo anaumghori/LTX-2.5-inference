@@ -14,7 +14,6 @@ class _PassState:
     """What one transformer pass remembers from the last step it computed in full."""
     def __init__(self):
         self.leading_video = None
-        self.leading_audio = None
         self.residual_video = None
         self.residual_audio = None
         self.residual_step_index = -1
@@ -55,17 +54,45 @@ class ResidualCache:
         self._computed_passes = 0
         self._reused_passes = 0
         self._drift_spent = 0.0
+        self._exhausted = False
+        self._min_difference = None
+
+    @property
+    def exhausted(self):
+        return self._exhausted
+
+    def needs_probe(self, pass_name):
+        return (
+            self.decides
+            and pass_name == self.decision_pass
+            and not self._exhausted
+            and self._step_index >= self.warmup_steps - 1
+        )
+
+    def should_record(self):
+        """Whether computed residuals from this step could still be replayed on a later step."""
+        return not self._exhausted and self._step_index >= self.warmup_steps - 1
 
     def begin_step(self, step_index):
         """Open a denoising step and work out whether its passes may be reused."""
         self._step_index = step_index
         self._pass_name = None
         self._step_reuse = False
+        if self._exhausted:
+            self._passes.clear()
+            self._step_eligible = False
+            return
+        decision_state = self._passes.get(self.decision_pass)
+        has_baseline = (
+            decision_state is not None
+            and decision_state.leading_video is not None
+            and decision_state.residual_video is not None
+        )
         self._step_eligible = (
             self.decides
             and step_index >= self.warmup_steps
             and self._consecutive_reused_steps < self.max_consecutive_reused_steps
-            and bool(self._passes)
+            and has_baseline
         )
         if self.decides and not self._step_eligible:
             logger.debug(
@@ -79,51 +106,64 @@ class ResidualCache:
         self._pass_name = pass_name
         return self
 
-    def decide(self, pass_name, leading_video, leading_audio):
+    def decide(self, pass_name, leading_video=None):
         """Return whether this half's region can be replayed instead of computed"""
         self._require_pass(pass_name)
         if not self.decides:
             raise RuntimeError("A following cache has no decision logic; it replays what it is told to.")
-        state = self._passes.setdefault(pass_name, _PassState())
-        positive_video = leading_video[-1:]
-        positive_audio = leading_audio[-1:]
-        difference = 0.0
         if pass_name != self.decision_pass:
             reuse = self._step_reuse
             logger.debug(f"Cache step {self._step_index}: pass {pass_name!r} follows the decision, reuse={reuse}")
-        elif state.leading_video is None:
-            # The first step of the stage has nothing to compare against, so it spends none of
-            # the budget either.
+            return reuse
+        state = self._passes.setdefault(pass_name, _PassState())
+        difference = 0.0
+        if self._exhausted or leading_video is None:
             reuse = False
         else:
-            self._check_shapes(positive_video, state.leading_video, pass_name)
-            self._check_shapes(positive_audio, state.leading_audio, pass_name)
-            difference = self._relative_difference(positive_video, state.leading_video)
-            within_budget = self._drift_spent + difference <= self.drift_budget
-            reuse = self._step_eligible and within_budget
-            if reuse:
-                self._drift_spent += difference
-            logger.debug(
-                f"Cache step {self._step_index}: leading residual difference {difference:.5f}, "
-                f"drift {self._drift_spent:.5f} of {self.drift_budget:.5f}, "
-                f"eligible {self._step_eligible}, reuse={reuse} for blocks "
-                f"{self.replay_start} to {self.replay_end - 1}"
-            )
-        if pass_name == self.decision_pass:
-            self._step_reuse = reuse
-            if reuse:
-                self._consecutive_reused_steps += 1
+            positive_video = leading_video[-1:]
+            if state.leading_video is None:
+                # The first probed step has nothing to compare against, so it spends none of
+                # the budget either.
+                reuse = False
             else:
-                self._consecutive_reused_steps = 0
-            age = self._step_index - state.residual_step_index if state.residual_video is not None else -1
-            mark(
-                f"cache lane={self.lane_index} step={self._step_index} reuse={int(reuse)} "
-                f"eligible={int(self._step_eligible)} "
-                f"difference={difference:.5f} spent={self._drift_spent:.5f} "
-                f"budget={self.drift_budget:.5f} age={age}"
-            )
-        state.leading_video = positive_video.detach().clone()
-        state.leading_audio = positive_audio.detach().clone()
+                self._check_shapes(positive_video, state.leading_video, pass_name)
+                if self._step_eligible:
+                    difference = self._relative_difference(positive_video, state.leading_video)
+                    self._min_difference = (
+                        difference if self._min_difference is None else min(self._min_difference, difference)
+                    )
+                    reuse = self._drift_spent + difference <= self.drift_budget
+                    if reuse:
+                        self._drift_spent += difference
+                    remaining = self.drift_budget - self._drift_spent
+                    if (
+                        remaining <= 0.0
+                        or (self._drift_spent > 0.0 and remaining < self._min_difference * 0.25)
+                        or (not reuse and self._drift_spent > 0.0 and remaining < self._min_difference * 0.5)
+                    ):
+                        self._exhausted = True
+                        logger.debug(
+                            f"Cache step {self._step_index}: drift budget exhausted "
+                            f"(remaining {remaining:.5f}, min step delta {self._min_difference:.5f})"
+                        )
+                else:
+                    reuse = False
+                logger.debug(
+                    f"Cache step {self._step_index}: leading residual difference {difference:.5f}, "
+                    f"drift {self._drift_spent:.5f} of {self.drift_budget:.5f}, "
+                    f"eligible {self._step_eligible}, reuse={reuse} for blocks "
+                    f"{self.replay_start} to {self.replay_end - 1}"
+                )
+            state.leading_video = None if self._exhausted else positive_video.detach()
+        self._step_reuse = reuse
+        self._consecutive_reused_steps = self._consecutive_reused_steps + 1 if reuse else 0
+        age = self._step_index - state.residual_step_index if state.residual_video is not None else -1
+        mark(
+            f"cache lane={self.lane_index} step={self._step_index} reuse={int(reuse)} "
+            f"eligible={int(self._step_eligible)} "
+            f"difference={difference:.5f} spent={self._drift_spent:.5f} "
+            f"budget={self.drift_budget:.5f} age={age}"
+        )
         return reuse
 
     def replay(self, pass_name):
@@ -170,6 +210,8 @@ class ResidualCache:
         self._computed_passes = 0
         self._reused_passes = 0
         self._drift_spent = 0.0
+        self._exhausted = False
+        self._min_difference = None
 
     def _require_pass(self, pass_name):
         if self._pass_name != pass_name:
@@ -187,4 +229,4 @@ class ResidualCache:
 
     @staticmethod
     def _relative_difference(current, cached):
-        return (current - cached).abs().mean().item() / (cached.abs().mean().item() + 1e-8)
+        return ((current - cached).abs().mean() / (cached.abs().mean() + 1e-8)).item()

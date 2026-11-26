@@ -18,7 +18,6 @@ from src.model.pipeline import (
     pack_video_latents,
     renoise_packed_latents,
     stage_one_schedulers,
-    stage_two_schedulers,
     unpack_audio_latents,
     unpack_video_latents,
 )
@@ -38,7 +37,7 @@ from src.profiling import end_step
 
 logger = get_logger(__name__)
 
-_conv_lock = threading.Lock()
+_cudnn_deterministic_lock = threading.Lock()
 
 @dataclasses.dataclass
 class BackLane(LaneState):
@@ -53,6 +52,15 @@ class BackLane(LaneState):
     # The stage-constant conditioning of each (stage, batch) pair already sent to this GPU.
     conditioning: dict
     text_guidance: bool = False
+
+
+@dataclasses.dataclass
+class DecodePayload:
+    latents: torch.Tensor
+    audio_latents: torch.Tensor
+    video_grid: object
+    audio_grid: object
+    seed: int
 
 
 class BackHalf(Half):
@@ -110,7 +118,7 @@ class BackHalf(Half):
         left = (resized_w - width) // 2
         image = image[:, :, top:top + height, left:left + width]
         vae_dtype = next(self.vae.parameters()).dtype
-        with _conv_lock:
+        with _cudnn_deterministic_lock:
             latents = self.vae.encode(image.to(vae_dtype).unsqueeze(2))
         latents = DiagonalGaussian(latents.float()).mode()
         return normalize_video_latents(
@@ -182,9 +190,7 @@ class BackHalf(Half):
                 )
         else:
             lane.stage_settings = stage2_settings(lane.settings)
-            lane.scheduler, lane.audio_scheduler, lane.timesteps = stage_two_schedulers(
-                self.model_config.scheduler, self.engine_config.stage2_sigmas, self.device
-            )
+            lane.scheduler, lane.audio_scheduler, lane.timesteps = self.stage_two_schedulers()
             lane.cache = None
             lane.video_grid = lane.video_grid.refined()
         lane.stage = stage
@@ -476,7 +482,7 @@ class BackHalf(Half):
             self.vae.config.scaling_factor,
         )
         upsampler_dtype = next(self.upsampler.parameters()).dtype
-        with _conv_lock:
+        with _cudnn_deterministic_lock:
             upsampled = self.upsampler(stage1_video.to(upsampler_dtype))
         refined = coarse_grid.refined()
         stage2_video = normalize_video_latents(
@@ -523,39 +529,45 @@ class BackHalf(Half):
             f"Request {lane.request_id} refinement stage prepared: {refined.tokens} video tokens at "
             f"{refined.latent_height}x{refined.latent_width}, {len(lane.timesteps)} steps"
         )
-        return lane.latents, lane.audio_latents, (video_noise, audio_noise)
+        return lane.latents, lane.audio_latents
+
+    def decode_payload(self, lane):
+        # Refinement produces no audio of its own, so a refined request decodes the audio
+        # the coarse stage finished with.
+        return DecodePayload(
+            latents=lane.latents,
+            audio_latents=lane.coarse_audio_latents if lane.stage == 1 else lane.audio_latents,
+            video_grid=lane.video_grid,
+            audio_grid=lane.audio_grid,
+            seed=lane.settings.seed,
+        )
 
     @torch.no_grad()
-    def decode(self, lane):
-        """Decode the finished latents into a video and a waveform."""
-        final = lane.video_grid
+    def decode(self, payload):
+        """Decode finished latents into a video and a waveform."""
+        final = payload.video_grid
         latents = unpack_video_latents(
-            lane.latents,
+            payload.latents,
             final.latent_frames,
             final.latent_height,
             final.latent_width,
             self.geometry.transformer_patch_size,
             self.geometry.transformer_patch_size_t,
         )
-        # Refinement produces no audio of its own, so a refined request decodes the audio
-        # the coarse stage finished with.
-        final_audio = lane.coarse_audio_latents if lane.stage == 1 else lane.audio_latents
         audio_latents = denormalize_audio_latents(
-            final_audio, self.audio_vae.latents_mean, self.audio_vae.latents_std
+            payload.audio_latents, self.audio_vae.latents_mean, self.audio_vae.latents_std
         )
-        audio_latents = unpack_audio_latents(audio_latents, lane.audio_grid.mel_bins)
+        audio_latents = unpack_audio_latents(audio_latents, payload.audio_grid.mel_bins)
         latents = denormalize_video_latents(
             latents, self.vae.latents_mean, self.vae.latents_std, self.vae.config.scaling_factor
         )
-        generator = torch.Generator(device=self.device).manual_seed(lane.settings.seed)
+        generator = torch.Generator(device=self.device).manual_seed(payload.seed)
         vae_dtype = next(self.vae.parameters()).dtype
-        with _conv_lock:
-            video = self.vae.decode(latents.to(vae_dtype), generator=generator)
-        with _conv_lock:
-            generated_mel = self.audio_vae.decode(
-                audio_latents.to(next(self.audio_vae.parameters()).dtype)
-            )
-        with _conv_lock:
+        video = self.vae.decode(latents.to(vae_dtype), generator=generator)
+        generated_mel = self.audio_vae.decode(
+            audio_latents.to(next(self.audio_vae.parameters()).dtype)
+        )
+        with _cudnn_deterministic_lock:
             # The vocoder's transposed convolutions can select a nondeterministic cuDNN
             # algorithm, so determinism is scoped to this call.
             previous_cudnn_deterministic = torch.backends.cudnn.deterministic
